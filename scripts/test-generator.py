@@ -35,6 +35,7 @@ class BranchCase:
     expected_exception: str | None
     expected_return: str | None  # repr string or None
     is_happy_path: bool
+    expected_exception_match: str | None = None  # re.escape'd message for match=r"..."
 
 
 @dataclass
@@ -660,6 +661,11 @@ def analyze_method_branches(method: MethodInfo) -> list[BranchCase]:
                 for child in stmt.body:
                     if isinstance(child, ast.Raise):
                         exc = _exc_short(child.exc)
+                        exc_msg = None
+                        if isinstance(child.exc, ast.Call) and child.exc.args:
+                            first = child.exc.args[0]
+                            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                                exc_msg = re.escape(first.value[:60])
                         cases.append(BranchCase(
                             test_name=f"raise{exc}_when{when_name}",
                             input_overrides=inputs,
@@ -668,6 +674,7 @@ def analyze_method_branches(method: MethodInfo) -> list[BranchCase]:
                             expected_exception=exc,
                             expected_return=None,
                             is_happy_path=False,
+                            expected_exception_match=exc_msg,
                         ))
                         # boundary value cases for numeric / length conditions
                         cases.extend(
@@ -1254,6 +1261,66 @@ def _mock_args(deps: list[DepInfo]) -> list[str]:
     return [f"mock_{dep.name.lower()}" for dep in deps]
 
 
+_BUILTIN_TYPES = {"dict", "list", "str", "int", "float", "bool", "bytes", "set", "tuple"}
+
+
+def _return_type_assertion(return_type: str) -> str:
+    """Return an isinstance-based assertion string for the given return type annotation."""
+    rt = return_type.strip().strip("'\"")
+    m = re.match(r"Optional\[(.+)\]$", rt)
+    if m:
+        base = m.group(1).strip().split("[")[0]
+        if base in _BUILTIN_TYPES:
+            return f"        assert result is None or isinstance(result, {base})"
+        return f"        assert result is None or result is not None"
+    base = rt.split("[")[0].strip()
+    if base in _BUILTIN_TYPES:
+        return f"        assert isinstance(result, {base})"
+    if base and base[0].isupper():
+        return f"        assert isinstance(result, {base})"
+    return f"        assert result is not None"
+
+
+def _infer_dep_call_assertions(
+    method: MethodInfo,
+    deps: list[DepInfo],
+    ctor_map: dict[str, str],
+) -> list[str]:
+    """Walk method body AST for self.dep.method() calls and return assert_called_once() lines."""
+    if not method.ast_node or not deps:
+        return [f"        # TODO: verify side effects manually"]
+
+    dep_type_to_mock = {dep.name: f"mock_{dep.name.lower()}" for dep in deps}
+    attr_to_mock: dict[str, str] = {}
+    for attr, dep_type in ctor_map.items():
+        if dep_type in dep_type_to_mock:
+            attr_to_mock[attr] = dep_type_to_mock[dep_type]
+    for dep in deps:
+        fallback_attr = dep.alias or dep.name.lower()
+        if fallback_attr not in attr_to_mock:
+            attr_to_mock[fallback_attr] = f"mock_{dep.name.lower()}"
+
+    assertions: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(method.ast_node):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Attribute)
+                and isinstance(func.value.value, ast.Name)
+                and func.value.value.id == "self"):
+            attr = func.value.attr
+            called_method = func.attr
+            mock_name = attr_to_mock.get(attr)
+            if mock_name:
+                key = f"{mock_name}.{called_method}"
+                if key not in seen:
+                    seen.add(key)
+                    assertions.append(f"        {mock_name}.{called_method}.assert_called_once()")
+    return assertions or [f"        # TODO: verify side effects manually"]
+
+
 def _build_python_test_method(
     method: MethodInfo,
     branch: BranchCase,
@@ -1346,7 +1413,10 @@ def _build_python_test_method(
 
     if branch.expected_exception:
         lines.append(f"        # Then")
-        lines.append(f"        with pytest.raises({branch.expected_exception}):")
+        if branch.expected_exception_match:
+            lines.append(f"        with pytest.raises({branch.expected_exception}, match=r\"{branch.expected_exception_match}\"):")
+        else:
+            lines.append(f"        with pytest.raises({branch.expected_exception}):")
         lines.append(f"            {aw}{call_expr}")
         return "\n".join(lines)
 
@@ -1360,13 +1430,14 @@ def _build_python_test_method(
     lines.append(f"        # Then")
 
     if method.is_void:
-        lines.append(f"        # TODO:CLAUDE_FILL verify side effects / mock calls")
+        for assertion in _infer_dep_call_assertions(method, deps, constructor_dep_map or {}):
+            lines.append(assertion)
     elif branch.expected_return == "None":
         lines.append(f"        assert result is None")
     elif captured_result is not None and branch.is_happy_path:
         lines.append(f"        assert result == {captured_result}")
     elif method.return_type and method.return_type not in (None, "None"):
-        lines.append(f"        assert result is not None")
+        lines.append(_return_type_assertion(method.return_type))
     else:
         lines.append(f"        # TODO:CLAUDE_FILL - add assertion")
 
