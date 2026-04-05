@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import re
 
-from tgen.analysis.python_ast import SAMPLE_VALUES, _type_sample
-from tgen.cases.branch import _camel
-from tgen.models import BranchCase, MethodInfo
+from pyforge.analysis.python_ast import SAMPLE_VALUES, _type_sample
+from pyforge.cases.branch import _camel
+from pyforge.models import BranchCase, MethodInfo
 
 
 def null_combination_cases(method: MethodInfo) -> list[BranchCase]:

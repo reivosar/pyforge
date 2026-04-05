@@ -5,7 +5,7 @@ import ast
 import re
 from pathlib import Path
 
-from tgen.cases.branch import _camel
+from pyforge.cases.branch import _camel
 
 
 def detect_api_framework(source: str) -> str | None:

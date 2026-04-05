@@ -1,28 +1,24 @@
-#!/usr/bin/env python3
-"""Auto test generator — Python only. Static analysis first, Claude only for void methods."""
+"""pyforge CLI — auto test generator for Python files."""
 
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-# ── tgen package path setup ────────────────────────────────────────────────��──
-sys.path.insert(0, str(Path(__file__).parent))
-
-from tgen.analysis.python_ast import (  # noqa: E402
+from pyforge.analysis.python_ast import (
     analyze_python,
     detect_framework,
     detect_lang,
     project_root,
 )
-from tgen.coverage import (  # noqa: E402
+from pyforge.coverage import (
     find_uncovered_methods,
     resolve_api_test_path,
     resolve_test_path,
     run_coverage,
 )
-from tgen.renderers.api_renderer import detect_api_framework, generate_api_tests  # noqa: E402
-from tgen.renderers.pytest_renderer import generate_python_test_file  # noqa: E402
+from pyforge.renderers.api_renderer import detect_api_framework, generate_api_tests
+from pyforge.renderers.pytest_renderer import generate_python_test_file
 
 
 def die(msg: str) -> None:
@@ -31,7 +27,7 @@ def die(msg: str) -> None:
 
 
 def info(msg: str) -> None:
-    print(f"[test-gen] {msg}")
+    print(f"[pyforge] {msg}")
 
 
 def call_claude(prompt: str) -> str:
@@ -113,7 +109,7 @@ def main():
     if not target.exists():
         die(f"File not found: {target}")
 
-    lang = detect_lang(target)   # raises SystemExit for non-.py files
+    lang = detect_lang(target)
     root = project_root(target)
     framework = detect_framework(lang, root)
     info(f"Language: {lang} / {framework}")
@@ -191,7 +187,7 @@ def main():
 
     # ── DB integration test generation ────────────────────────────────────────
     if args.db_integration:
-        from tgen.renderers.db_integration_renderer import generate_db_integration_block
+        from pyforge.renderers.db_integration_renderer import generate_db_integration_block
         integration_block, conftest_content = generate_db_integration_block(target, root, src_info)
         if integration_block:
             test_path.write_text(test_path.read_text().rstrip() + "\n\n" + integration_block)

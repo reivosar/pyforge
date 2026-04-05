@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tgen.models import MethodInfo, SourceInfo
+from pyforge.models import MethodInfo, SourceInfo
 
 
 def project_root_from_path(target: Path) -> Path:

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tgen.analysis.python_ast import detect_orm_models
-from tgen.models import ClassInfo, DepInfo, OrmModelInfo, SourceInfo
-from tgen.renderers.pytest_renderer import _PYTHON_DB_MOCKS
+from pyforge.analysis.python_ast import detect_orm_models
+from pyforge.models import ClassInfo, DepInfo, OrmModelInfo, SourceInfo
+from pyforge.renderers.pytest_renderer import _PYTHON_DB_MOCKS
 
 # DB type priority order (same as _PYTHON_DB_MOCKS key order)
 _DB_PREFIXES = list(_PYTHON_DB_MOCKS.keys())

@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from tgen.analysis.python_ast import SAMPLE_VALUES
-from tgen.models import MethodInfo, SourceInfo
+from pyforge.analysis.python_ast import SAMPLE_VALUES
+from pyforge.models import MethodInfo, SourceInfo
 
 
 def try_execute_and_capture(

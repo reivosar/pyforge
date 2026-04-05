@@ -1,16 +1,16 @@
 """Test case generation package — unified generate_cases() entry point."""
 from __future__ import annotations
 
-from tgen.cases.branch import analyze_method_branches
-from tgen.cases.combinatorial import (
+from pyforge.cases.branch import analyze_method_branches
+from pyforge.cases.combinatorial import (
     default_arg_cases,
     enum_cases,
     null_combination_cases,
     pairwise_cases,
     union_type_cases,
 )
-from tgen.cases.extreme import extreme_value_cases
-from tgen.models import BranchCase, MethodInfo
+from pyforge.cases.extreme import extreme_value_cases
+from pyforge.models import BranchCase, MethodInfo
 
 TIER_GENERATORS: dict[str, set[str]] = {
     "minimal": {

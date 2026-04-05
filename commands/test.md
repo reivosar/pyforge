@@ -1,33 +1,52 @@
-# /test — Auto Test Generator (90%+ coverage)
+# /test — Auto Test Generator (Python · pytest · 90%+ coverage)
 
-Generate a complete, high-coverage test file for the specified source file.
+Generate a complete, high-coverage pytest test file for the specified Python source file.
+
+> **Language support**: Python only (`.py` files). AST-based branch analysis, type inference, and DI detection.
 
 ## Usage
 
 ```
-/test <file_path>               # unit tests (external deps mocked)
-/test <file_path> --integration # integration tests (real services)
-/test <file_path> --api         # API/HTTP endpoint tests
+/test <file.py>                          # unit tests, standard mode
+/test <file.py> --integration            # integration tests (tests/integration/)
+/test <file.py> --api                    # API endpoint tests (FastAPI / Flask)
+/test <file.py> --mode minimal           # branches + happy path only
+/test <file.py> --mode exhaustive        # all strategies (pairwise, extreme, hypothesis…)
+/test <file.py> --execute-capture        # [opt-in] capture real return values for exact assertions
+COVERAGE_THRESHOLD=80 /test <file.py>   # override coverage threshold
 ```
+
+## Test generation modes
+
+| Mode | Strategies |
+|------|-----------|
+| `minimal` | explicit raise/return branches + happy path |
+| `standard` (default) | + boundary values, null combos, default args, enum exhaustion |
+| `exhaustive` | + pairwise, union types, extreme values, Hypothesis property tests |
 
 ## What this does
 
 **Unit mode (default)**
-1. Detect language and test framework automatically
-2. Analyze existing tests to match coding style
-3. Generate tests with ALL external deps mocked, targeting ≥90% coverage
-4. Run coverage — retry with targeted additions if threshold not met
-5. If test file already exists, detect new uncovered methods and append only those
+1. Parse Python AST to extract methods, branches, type hints, and external deps
+2. Generate tests with ALL external deps mocked, targeting ≥90% coverage
+3. Assertion inference: literal returns, bool return patterns, dataclass fields, dep call args
+4. Call Claude only for void/side-effect methods (`TODO:CLAUDE_FILL` bodies)
+5. Run coverage — retry with Claude if threshold not met
+6. If test file already exists, detect uncovered methods and append only those
 
-**Integration mode (--integration)**
-1. Detect integration test libraries already in the project (Testcontainers, supertest, etc.)
-2. Generate tests that hit REAL external services — no mocks
-3. Include setup/teardown for data isolation per test
-4. Output includes instructions for required env vars and how to run
+**Integration mode (`--integration`)**
+Tests written to `tests/integration/`. No mocks — real services required.
+
+**API mode (`--api`)**
+Detects FastAPI / Flask routes and generates status-code tests (200/201/404/422/401/500).
+
+**`--execute-capture`**
+Imports and executes the module to capture actual return values for exact assertions.
+⚠️ WARNING: triggers module-level code (DB connections, env vars, decorators). Use with care.
 
 ## Arguments
 
-- `$ARGUMENTS` — path to the source file to test (required)
+- `$ARGUMENTS` — path to the `.py` source file (required)
 
 ## Execution
 

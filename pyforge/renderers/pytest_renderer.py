@@ -5,12 +5,12 @@ import ast
 import re
 from pathlib import Path
 
-from tgen.analysis.python_ast import _type_sample, detect_enum_types
-from tgen.cases import TIER_GENERATORS, generate_cases
-from tgen.cases.branch import _camel, analyze_method_branches
-from tgen.cases.extreme import build_hypothesis_test
-from tgen.models import BranchCase, ClassInfo, DepInfo, MethodInfo, SourceInfo
-from tgen.runtime.capture import try_execute_and_capture
+from pyforge.analysis.python_ast import _type_sample, detect_enum_types
+from pyforge.cases import TIER_GENERATORS, generate_cases
+from pyforge.cases.branch import _camel, analyze_method_branches
+from pyforge.cases.extreme import build_hypothesis_test
+from pyforge.models import BranchCase, ClassInfo, DepInfo, MethodInfo, SourceInfo
+from pyforge.runtime.capture import try_execute_and_capture
 
 
 # ── DB mock specs ─────────────────────────────────────────────────────────────
@@ -464,32 +464,32 @@ def generate_methods_block(
             lines += ["", make_body(branch, captured)]
 
         if "null" in active:
-            from tgen.cases.combinatorial import null_combination_cases
+            from pyforge.cases.combinatorial import null_combination_cases
             for case in null_combination_cases(method):
                 lines += ["", make_body(case)]
 
         if "enum" in active:
-            from tgen.cases.combinatorial import enum_cases
+            from pyforge.cases.combinatorial import enum_cases
             for case in enum_cases(method, enum_types):
                 lines += ["", make_body(case)]
 
         if "pairwise" in active:
-            from tgen.cases.combinatorial import pairwise_cases
+            from pyforge.cases.combinatorial import pairwise_cases
             for case in pairwise_cases(method):
                 lines += ["", make_body(case)]
 
         if "defaults" in active:
-            from tgen.cases.combinatorial import default_arg_cases
+            from pyforge.cases.combinatorial import default_arg_cases
             for case in default_arg_cases(method):
                 lines += ["", make_body(case)]
 
         if "union" in active:
-            from tgen.cases.combinatorial import union_type_cases
+            from pyforge.cases.combinatorial import union_type_cases
             for case in union_type_cases(method):
                 lines += ["", make_body(case)]
 
         if "extreme" in active:
-            from tgen.cases.extreme import extreme_value_cases
+            from pyforge.cases.extreme import extreme_value_cases
             for case in extreme_value_cases(method):
                 lines += ["", make_body(case)]
 

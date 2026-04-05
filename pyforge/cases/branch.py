@@ -4,7 +4,7 @@ from __future__ import annotations
 import ast
 import re
 
-from tgen.models import BranchCase, MethodInfo
+from pyforge.models import BranchCase, MethodInfo
 
 
 _MAX_TEST_NAME = 80
@@ -156,7 +156,7 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
         arg = _arg_name_from_node(cond.args[0])
         if arg and arg in arg_types:
             type_s = ast.unparse(cond.args[1]).split(".")[-1].strip("()")
-            from tgen.analysis.python_ast import _type_sample
+            from pyforge.analysis.python_ast import _type_sample
             inputs[arg] = _type_sample(type_s)
         return inputs
 
@@ -235,7 +235,7 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
 
     # opaque call: if validate(x): → supply a type-sample for each Name arg
     if isinstance(cond, ast.Call):
-        from tgen.analysis.python_ast import _type_sample
+        from pyforge.analysis.python_ast import _type_sample
         for a in cond.args:
             arg = _arg_name_from_node(a)
             if arg and arg in arg_types:

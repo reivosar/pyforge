@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tgen.models import BranchCase, ClassInfo, DepInfo, MethodInfo, OrmModelInfo, SourceInfo
+from pyforge.models import BranchCase, ClassInfo, DepInfo, MethodInfo, OrmModelInfo, SourceInfo
 
 
 # ── project detection ─────────────────────────────────────────────────────────

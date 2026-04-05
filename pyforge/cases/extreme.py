@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import re
 
-from tgen.cases.branch import _camel
-from tgen.analysis.python_ast import _type_sample
-from tgen.models import BranchCase, DepInfo, MethodInfo
+from pyforge.cases.branch import _camel
+from pyforge.analysis.python_ast import _type_sample
+from pyforge.models import BranchCase, DepInfo, MethodInfo
 
 
 # ── extreme value constants ───────────────────────────────────────────────────
