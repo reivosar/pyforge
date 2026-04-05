@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tgen.models import BranchCase, ClassInfo, DepInfo, MethodInfo, SourceInfo
+from tgen.models import BranchCase, ClassInfo, DepInfo, MethodInfo, OrmModelInfo, SourceInfo
 
 
 # ── project detection ─────────────────────────────────────────────────────────
@@ -387,6 +387,63 @@ def analyze_python(target: Path, root: Path) -> SourceInfo:
         all_classes=all_classes,
         module_level_methods=[m for m in module_level_methods if m.is_public],
     )
+
+
+def detect_orm_models(target: Path) -> list[OrmModelInfo]:
+    """Return OrmModelInfo for each ORM model class defined in target.
+
+    Detects:
+    - SQLAlchemy: class inheriting from *Base / db.Model / DeclarativeBase
+    - Django: class inheriting from models.Model / Model
+    psycopg2 raw SQL has no model classes — returns [].
+    """
+    _SA_BASES = {"Base", "db.Model", "DeclarativeBase"}
+    _SA_COLUMN_FUNCS = {"Column", "mapped_column", "relationship"}
+    _DJ_BASES = {"models.Model", "Model"}
+    _DJ_FIELD_SUFFIXES = ("Field",)
+    _DJ_RELATION_FUNCS = {"ForeignKey", "ManyToManyField", "OneToOneField"}
+
+    try:
+        tree = ast.parse(target.read_text())
+    except SyntaxError:
+        return []
+
+    result: list[OrmModelInfo] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = [ast.unparse(b) for b in node.bases]
+
+        # SQLAlchemy
+        if any(b.endswith("Base") or b in _SA_BASES for b in bases):
+            col_attrs: list[str] = []
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    rhs = stmt.value
+                    if isinstance(rhs, ast.Call):
+                        func_name = ast.unparse(rhs.func).split(".")[-1]
+                        if func_name in _SA_COLUMN_FUNCS:
+                            for t in stmt.targets:
+                                if isinstance(t, ast.Name):
+                                    col_attrs.append(t.id)
+            result.append(OrmModelInfo(node.name, "sqlalchemy", col_attrs))
+            continue
+
+        # Django
+        if any(b in _DJ_BASES for b in bases):
+            field_attrs: list[str] = []
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    rhs = stmt.value
+                    if isinstance(rhs, ast.Call):
+                        func_name = ast.unparse(rhs.func).split(".")[-1]
+                        if func_name.endswith(_DJ_FIELD_SUFFIXES) or func_name in _DJ_RELATION_FUNCS:
+                            for t in stmt.targets:
+                                if isinstance(t, ast.Name):
+                                    field_attrs.append(t.id)
+            result.append(OrmModelInfo(node.name, "django", field_attrs))
+
+    return result
 
 
 def detect_enum_types(target: Path) -> dict[str, list[str]]:

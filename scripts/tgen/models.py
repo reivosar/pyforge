@@ -51,6 +51,13 @@ class ClassInfo:
 
 
 @dataclass
+class OrmModelInfo:
+    class_name: str          # e.g. "User"
+    db_type: str             # "sqlalchemy" | "django" | "psycopg2"
+    column_attrs: list[str]  # detected column/field attribute names
+
+
+@dataclass
 class SourceInfo:
     lang: str
     class_name: str | None          # first non-Enum class (backward compat)
