@@ -1,0 +1,561 @@
+"""pytest test file renderer for Python sources."""
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+from tgen.analysis.python_ast import _type_sample, detect_enum_types
+from tgen.cases import TIER_GENERATORS, generate_cases
+from tgen.cases.branch import _camel, analyze_method_branches
+from tgen.cases.extreme import build_hypothesis_test
+from tgen.models import BranchCase, ClassInfo, DepInfo, MethodInfo, SourceInfo
+from tgen.runtime.capture import try_execute_and_capture
+
+
+# ── DB mock specs ─────────────────────────────────────────────────────────────
+
+_PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
+    "sqlalchemy": (
+        "sqlalchemy_session",
+        [
+            "mock_{attr} = MagicMock(spec=Session)",
+            "mock_{attr}.query.return_value.filter.return_value.first.return_value = MagicMock()",
+            "mock_{attr}.query.return_value.filter.return_value.all.return_value = []",
+            "mock_{attr}.query.return_value.get.return_value = MagicMock()",
+            "mock_{attr}.add.return_value = None",
+            "mock_{attr}.commit.return_value = None",
+            "mock_{attr}.rollback.return_value = None",
+        ],
+    ),
+    "django.db": (
+        "django_orm",
+        [
+            "# Django ORM: use @pytest.mark.django_db on the test class",
+            "# or mock the queryset:",
+            "mock_{attr} = MagicMock()",
+            "mock_{attr}.filter.return_value = mock_{attr}",
+            "mock_{attr}.exclude.return_value = mock_{attr}",
+            "mock_{attr}.first.return_value = None",
+            "mock_{attr}.all.return_value = []",
+        ],
+    ),
+    "psycopg2": (
+        "psycopg2",
+        [
+            "mock_{attr} = MagicMock()",
+            "mock_cursor = MagicMock()",
+            "mock_{attr}.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)",
+            "mock_{attr}.cursor.return_value.__exit__ = MagicMock(return_value=False)",
+            "mock_cursor.fetchone.return_value = None",
+            "mock_cursor.fetchall.return_value = []",
+            "mock_cursor.rowcount = 0",
+        ],
+    ),
+    "pymongo": (
+        "pymongo",
+        [
+            "mock_{attr} = MagicMock()",
+            "mock_{attr}.find_one.return_value = None",
+            "mock_{attr}.find.return_value = iter([])",
+            "mock_{attr}.insert_one.return_value = MagicMock(inserted_id='mock_id')",
+            "mock_{attr}.update_one.return_value = MagicMock(modified_count=1)",
+            "mock_{attr}.delete_one.return_value = MagicMock(deleted_count=1)",
+        ],
+    ),
+    "motor": (
+        "motor_mongodb",
+        [
+            "mock_{attr} = AsyncMock()",
+            "mock_{attr}.find_one.return_value = None",
+            "mock_{attr}.find.return_value = AsyncMock(to_list=AsyncMock(return_value=[]))",
+            "mock_{attr}.insert_one.return_value = AsyncMock(inserted_id='mock_id')",
+        ],
+    ),
+    "redis": (
+        "redis",
+        [
+            "mock_{attr} = MagicMock()",
+            "mock_{attr}.get.return_value = None",
+            "mock_{attr}.set.return_value = True",
+            "mock_{attr}.delete.return_value = 1",
+            "mock_{attr}.exists.return_value = 0",
+        ],
+    ),
+    "boto3": (
+        "boto3",
+        [
+            "mock_{attr} = MagicMock()",
+            "mock_{attr}.Table.return_value.get_item.return_value = {'Item': {}}",
+            "mock_{attr}.Table.return_value.put_item.return_value = {}",
+            "mock_{attr}.Table.return_value.delete_item.return_value = {}",
+            "mock_{attr}.Table.return_value.query.return_value = {'Items': []}",
+        ],
+    ),
+}
+
+
+def detect_db_mocks_python(deps: list[DepInfo]) -> list[tuple[DepInfo, list[str]]]:
+    result = []
+    for dep in deps:
+        for prefix, (_, templates) in _PYTHON_DB_MOCKS.items():
+            if dep.module.startswith(prefix):
+                attr = (dep.alias or dep.name).lower()
+                lines = [t.format(attr=attr) for t in templates]
+                result.append((dep, lines))
+                break
+    return result
+
+
+# ── assertion helpers ─────────────────────────────────────────────────────────
+
+_BUILTIN_TYPES = {"dict", "list", "str", "int", "float", "bool", "bytes", "set", "tuple"}
+
+_MAX_TEST_NAME = 80
+
+
+def _truncate_test_name(name: str) -> str:
+    if len(name) <= _MAX_TEST_NAME:
+        return name
+    parts = name.split("_when", 1)
+    if len(parts) == 2:
+        prefix, condition = parts
+        budget = _MAX_TEST_NAME - len(prefix) - 5
+        return f"{prefix}_when{condition[:max(budget, 8)]}"
+    return name[:_MAX_TEST_NAME]
+
+
+def _return_type_assertion(return_type: str) -> str:
+    rt = return_type.strip().strip("'\"")
+    m = re.match(r"Optional\[(.+)\]$", rt)
+    if m:
+        base = m.group(1).strip().split("[")[0]
+        if base in _BUILTIN_TYPES:
+            return f"        assert result is None or isinstance(result, {base})"
+        return f"        assert result is None or result is not None"
+    base = rt.split("[")[0].strip()
+    if base in _BUILTIN_TYPES:
+        return f"        assert isinstance(result, {base})"
+    if base and base[0].isupper():
+        return f"        assert isinstance(result, {base})"
+    return f"        assert result is not None"
+
+
+def _infer_literal_return(method: MethodInfo) -> str | None:
+    """Scan method body for a dominant literal return and emit an exact assertion."""
+    if method.ast_node is None or method.is_void:
+        return None
+    literal_returns: list[str] = []
+    for node in ast.walk(method.ast_node):
+        if isinstance(node, ast.Return) and node.value is not None:
+            val = node.value
+            if isinstance(val, (ast.Dict, ast.List, ast.Tuple, ast.Set)):
+                literal_returns.append(ast.unparse(val))
+            elif isinstance(val, ast.Constant):
+                literal_returns.append(repr(val.value))
+            elif isinstance(val, ast.Name) and val.id in ("True", "False", "None"):
+                literal_returns.append(val.id)
+    if not literal_returns:
+        return None
+    non_none = [r for r in literal_returns if r != "None"]
+    if not non_none:
+        return None
+    if len(set(non_none)) == 1:
+        v = non_none[0]
+        if v in ("True", "False"):
+            return f"        assert result is {v}"
+        return f"        assert result == {v}"
+    return None
+
+
+def _infer_dataclass_assertions(
+    return_type: str,
+    all_classes: list[ClassInfo],
+) -> list[str]:
+    rt_base = return_type.split("[")[0].strip().strip("'\"")
+    matching = [c for c in all_classes if c.name == rt_base]
+    if not matching:
+        return [f"        assert isinstance(result, {rt_base})"]
+    cls = matching[0]
+    lines = [f"        assert isinstance(result, {rt_base})"]
+    for attr in list(cls.constructor_dep_map.keys())[:3]:
+        lines.append(f"        assert result.{attr} is not None")
+    return lines
+
+
+def _infer_dep_call_assertions(
+    method: MethodInfo,
+    deps: list[DepInfo],
+    ctor_map: dict[str, str],
+) -> list[str]:
+    """Walk method body for self.dep.method() calls and emit assert_called_once[_with]() lines."""
+    if not method.ast_node or not deps:
+        return ["        # TODO: verify side effects manually"]
+
+    dep_type_to_mock = {dep.name: f"mock_{dep.name.lower()}" for dep in deps}
+    attr_to_mock: dict[str, str] = {}
+    for attr, dep_type in ctor_map.items():
+        if dep_type in dep_type_to_mock:
+            attr_to_mock[attr] = dep_type_to_mock[dep_type]
+    for dep in deps:
+        fallback_attr = dep.alias or dep.name.lower()
+        if fallback_attr not in attr_to_mock:
+            attr_to_mock[fallback_attr] = f"mock_{dep.name.lower()}"
+
+    assertions: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(method.ast_node):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Attribute)
+                and isinstance(func.value.value, ast.Name)
+                and func.value.value.id == "self"):
+            attr = func.value.attr
+            called_method = func.attr
+            mock_name = attr_to_mock.get(attr)
+            if mock_name:
+                key = f"{mock_name}.{called_method}"
+                if key not in seen:
+                    seen.add(key)
+                    if node.args or node.keywords:
+                        is_simple = all(
+                            isinstance(a, (ast.Name, ast.Constant, ast.Attribute))
+                            for a in node.args
+                        )
+                        if is_simple:
+                            arg_reprs = [ast.unparse(a) for a in node.args]
+                            kw_reprs = [f"{k.arg}={ast.unparse(k.value)}" for k in node.keywords]
+                            all_args_str = ", ".join(arg_reprs + kw_reprs)
+                            if all_args_str:
+                                assertions.append(
+                                    f"        {mock_name}.{called_method}"
+                                    f".assert_called_once_with({all_args_str})"
+                                )
+                                continue
+                    assertions.append(f"        {mock_name}.{called_method}.assert_called_once()")
+    return assertions or ["        # TODO: verify side effects manually"]
+
+
+# ── patch / mock helpers ──────────────────────────────────────────────────────
+
+def _patch_decorators(deps: list[DepInfo], module_path: str) -> list[str]:
+    return [f"@patch('{module_path}.{dep.name}')" for dep in deps]
+
+
+def _mock_args(deps: list[DepInfo]) -> list[str]:
+    return [f"mock_{dep.name.lower()}" for dep in deps]
+
+
+# ── test method builder ───────────────────────────────────────────────────────
+
+def build_python_test_method(
+    method: MethodInfo,
+    branch: BranchCase,
+    deps: list[DepInfo],
+    module_path: str,
+    class_name: str | None,
+    captured_result: str | None,
+    constructor_dep_map: dict[str, str] | None = None,
+    all_classes: list[ClassInfo] | None = None,
+) -> str:
+    use_class_directly = method.is_static or method.is_classmethod
+    # For static/classmethod, only patch deps that actually appear in the method body.
+    # Instance-injected deps (from ctor_map) are irrelevant — static methods cannot
+    # access self.attr, so patching them produces dead mock args.
+    if use_class_directly and method.ast_node:
+        body_src = ast.unparse(method.ast_node)
+        deps = [d for d in deps if d.name in body_src]
+
+    nd_patches = [f"@patch('{p}')" for p in method.nondeterministic_patches]
+    nd_mock_args = [f"mock_{p.replace('.', '_')}" for p in method.nondeterministic_patches]
+    decorators = _patch_decorators(deps, module_path) + nd_patches
+    mock_args = _mock_args(deps) + nd_mock_args
+    all_args = ["self"] + mock_args
+    db_mock_map: dict[str, list[str]] = {
+        dep.name: lines for dep, lines in detect_db_mocks_python(deps)
+    }
+
+    if branch.is_happy_path:
+        if method.is_void:
+            test_name = f"callDependency_when{_camel(method.name)}InvokedWithValidArgs"
+        elif method.return_type and method.return_type not in (None, "None"):
+            ret_label = method.return_type.split("[")[0].strip("'\"")
+            test_name = f"return{ret_label}_when{_camel(method.name)}CalledWithValidArgs"
+        else:
+            test_name = f"complete_when{_camel(method.name)}CalledWithValidArgs"
+    else:
+        test_name = branch.test_name
+
+    lines: list[str] = []
+    if method.is_async:
+        lines.append(f"    @pytest.mark.asyncio")
+    for d in decorators:
+        lines.append(f"    {d}")
+    async_kw = "async " if method.is_async else ""
+    lines.append(f"    {async_kw}def {test_name}({', '.join(all_args)}):")
+
+    for dep, mock_arg in zip(deps, mock_args):
+        if dep.name in db_mock_map:
+            for setup_line in db_mock_map[dep.name]:
+                lines.append(f"        {setup_line}")
+        elif branch.mock_side_effect:
+            lines.append(f"        {mock_arg}.side_effect = {branch.mock_side_effect}('mocked error')")
+        elif branch.mock_return_override is not None:
+            lines.append(f"        {mock_arg}.return_value = {branch.mock_return_override}")
+        else:
+            lines.append(f"        {mock_arg}.return_value = MagicMock()")
+
+    call_args = ", ".join(
+        f"{arg}={branch.input_overrides.get(arg, _type_sample(method.arg_types.get(arg)))}"
+        for arg in method.args
+    )
+
+    if class_name and not use_class_directly:
+        ctor_map = constructor_dep_map or {}
+        if ctor_map:
+            dep_type_to_mock: dict[str, str] = {
+                dep.name: mock_arg
+                for dep, mock_arg in zip(deps, mock_args[:len(deps)])
+            }
+            ctor_kwargs = ", ".join(
+                f"{attr}={dep_type_to_mock.get(type_name, 'MagicMock()')}"
+                for attr, type_name in ctor_map.items()
+            )
+            lines.append(f"        sut = {class_name}({ctor_kwargs})")
+        else:
+            lines.append(f"        sut = {class_name}()")
+            for dep, mock_arg in zip(deps, mock_args):
+                attr = dep.alias or dep.name.lower()
+                lines.append(f"        sut.{attr} = {mock_arg}.return_value")
+        lines.append(f"")
+
+    lines.append(f"        # When")
+    aw = "await " if method.is_async else ""
+    if use_class_directly:  # already defined above
+        caller = class_name if class_name else method.name
+        call_expr = f"{caller}.{method.name}({call_args})"
+    elif class_name:
+        call_expr = f"sut.{method.name}({call_args})"
+    else:
+        call_expr = f"{method.name}({call_args})"
+
+    if branch.expected_exception:
+        lines.append(f"        # Then")
+        if branch.expected_exception_match:
+            lines.append(
+                f"        with pytest.raises({branch.expected_exception},"
+                f" match=r\"{branch.expected_exception_match}\"):"
+            )
+        else:
+            lines.append(f"        with pytest.raises({branch.expected_exception}):")
+        lines.append(f"            {aw}{call_expr}")
+        return "\n".join(lines)
+
+    if method.is_void:
+        lines.append(f"        {aw}{call_expr}")
+    else:
+        lines.append(f"        result = {aw}{call_expr}")
+
+    lines.append(f"")
+    lines.append(f"        # Then")
+
+    if method.is_void:
+        for assertion in _infer_dep_call_assertions(method, deps, constructor_dep_map or {}):
+            lines.append(assertion)
+    elif branch.expected_return == "None":
+        lines.append(f"        assert result is None")
+    elif branch.expected_return in ("True", "False"):
+        lines.append(f"        assert result is {branch.expected_return}")
+    elif captured_result is not None and branch.is_happy_path:
+        lines.append(f"        assert result == {captured_result}")
+    elif branch.is_happy_path:
+        literal_assert = _infer_literal_return(method)
+        if literal_assert:
+            lines.append(literal_assert)
+        elif method.return_type and method.return_type not in (None, "None"):
+            for a in _infer_dataclass_assertions(method.return_type, all_classes or []):
+                lines.append(a)
+        else:
+            lines.append(f"        assert result is not None  # TODO:CLAUDE_FILL verify exact value")
+    elif method.return_type and method.return_type not in (None, "None"):
+        lines.append(_return_type_assertion(method.return_type))
+    else:
+        lines.append(f"        assert result is not None  # TODO:CLAUDE_FILL verify exact value")
+
+    return "\n".join(lines)
+
+
+# ── methods block generator ───────────────────────────────────────────────────
+
+def generate_methods_block(
+    methods: list[MethodInfo],
+    deps: list[DepInfo],
+    module_path: str,
+    class_name: str | None,
+    ctor_map: dict[str, str],
+    enum_types: dict[str, list[str]],
+    target: Path,
+    root: Path,
+    info_: SourceInfo,
+    mode: str = "standard",
+    execute_capture: bool = False,
+) -> list[str]:
+    """Generate all test method lines for a list of methods."""
+    active = TIER_GENERATORS.get(mode, TIER_GENERATORS["standard"])
+    lines: list[str] = []
+    all_classes = info_.all_classes
+
+    for method in methods:
+        branches = analyze_method_branches(method)
+
+        if mode == "minimal":
+            branches = [
+                b for b in branches
+                if b.expected_exception is not None
+                or (b.expected_return is not None and not b.is_happy_path)
+                or b.is_happy_path
+            ]
+
+        captured = None
+        if execute_capture and not method.is_void and not method.is_async:
+            captured = try_execute_and_capture(target, root, info_, method)
+
+        def make_body(case: BranchCase, cap: str | None = None) -> str:
+            return build_python_test_method(
+                method, case, deps, module_path, class_name, cap, ctor_map, all_classes,
+            )
+
+        for branch in branches:
+            lines += ["", make_body(branch, captured)]
+
+        if "null" in active:
+            from tgen.cases.combinatorial import null_combination_cases
+            for case in null_combination_cases(method):
+                lines += ["", make_body(case)]
+
+        if "enum" in active:
+            from tgen.cases.combinatorial import enum_cases
+            for case in enum_cases(method, enum_types):
+                lines += ["", make_body(case)]
+
+        if "pairwise" in active:
+            from tgen.cases.combinatorial import pairwise_cases
+            for case in pairwise_cases(method):
+                lines += ["", make_body(case)]
+
+        if "defaults" in active:
+            from tgen.cases.combinatorial import default_arg_cases
+            for case in default_arg_cases(method):
+                lines += ["", make_body(case)]
+
+        if "union" in active:
+            from tgen.cases.combinatorial import union_type_cases
+            for case in union_type_cases(method):
+                lines += ["", make_body(case)]
+
+        if "extreme" in active:
+            from tgen.cases.extreme import extreme_value_cases
+            for case in extreme_value_cases(method):
+                lines += ["", make_body(case)]
+
+        if "hypothesis" in active:
+            hyp = build_hypothesis_test(method, deps, module_path, class_name, ctor_map)
+            if hyp:
+                lines += ["", hyp]
+
+    return lines
+
+
+# ── main test file generator ──────────────────────────────────────────────────
+
+def generate_python_test_file(
+    target: Path,
+    root: Path,
+    info_: SourceInfo,
+    threshold: int,
+    mode: str = "standard",
+    execute_capture: bool = False,
+) -> str:
+    all_methods = [m for c in info_.all_classes for m in c.methods] + info_.module_level_methods
+    needs_async = any(m.is_async for m in all_methods)
+    needs_async_mock = any(dep.module.startswith("motor") for dep in info_.external_deps)
+    needs_sys = any(
+        m.arg_types.get(a, "").split("[")[0].strip() == "int"
+        for m in all_methods for a in m.args
+    )
+
+    mock_imports = "MagicMock, patch"
+    if needs_async_mock:
+        mock_imports = "MagicMock, patch, AsyncMock"
+
+    has_hypothesis = (
+        TIER_GENERATORS.get(mode, set()).issuperset({"hypothesis"})
+        and any(
+            m.args and not m.is_void and any(a in m.arg_types for a in m.args)
+            for m in all_methods
+        )
+    )
+
+    import_names = ", ".join(c.name for c in info_.all_classes) or (info_.class_name or "*")
+
+    imports = [
+        "import asyncio",
+        "import sys",
+        "import pytest",
+        f"from unittest.mock import {mock_imports}",
+        f"from {info_.module_path} import {import_names}",
+    ]
+    if needs_async:
+        imports.append("# pip install pytest-asyncio  (needed for async tests)")
+    if has_hypothesis:
+        imports += [
+            "from hypothesis import given, settings",
+            "from hypothesis import strategies as st",
+        ]
+    imports += ["", ""]
+
+    enum_types = detect_enum_types(target)
+    sections: list[str] = []
+
+    for cls in info_.all_classes:
+        sections.append(f"class Test{cls.name}:")
+        method_lines = generate_methods_block(
+            methods=cls.methods,
+            deps=info_.external_deps,
+            module_path=info_.module_path,
+            class_name=cls.name,
+            ctor_map=cls.constructor_dep_map,
+            enum_types=enum_types,
+            target=target,
+            root=root,
+            info_=info_,
+            mode=mode,
+            execute_capture=execute_capture,
+        )
+        if not method_lines:
+            sections.append("    pass")
+        else:
+            sections.extend(method_lines)
+        sections.append("")
+
+    if info_.module_level_methods:
+        sections.append(f"class Test{target.stem.capitalize()}Functions:")
+        method_lines = generate_methods_block(
+            methods=info_.module_level_methods,
+            deps=info_.external_deps,
+            module_path=info_.module_path,
+            class_name=None,
+            ctor_map={},
+            enum_types=enum_types,
+            target=target,
+            root=root,
+            info_=info_,
+            mode=mode,
+            execute_capture=execute_capture,
+        )
+        sections.extend(method_lines)
+        sections.append("")
+
+    return "\n".join(imports) + "\n".join(sections) + "\n"
