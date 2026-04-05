@@ -67,7 +67,8 @@ COVERAGE_THRESHOLD=80 /test <file.py>   # override coverage threshold
 | Untyped arg edge values | No type hint → `None` / `""` / `0` / `[]` / `{}` |
 | Loop-inner boundary lift | `for item in items: if item > N:` → `items=[N+1]` input override |
 | Opaque condition inputs | `if validate(x):` → type-sample value for each Name arg |
-| Hypothesis property tests | `@given` + type hints → auto strategy mapping |
+| Hypothesis property tests | `@given` + type hints → auto strategy mapping; async methods wrapped with `asyncio.run()` |
+| **Usage-based type inference** | No type hint? Infers from default values, comparisons (`arg > 0` → `int`), method calls (`arg.strip()` → `str`, `arg.append()` → `list`, `arg.get()` → `dict`), arithmetic, `for x in arg`, `len(arg)` |
 
 ### Assertion Inference (priority chain)
 1. `pytest.raises(Exc, match=r"...")` for explicit raise branches (message extracted from AST)
@@ -86,6 +87,7 @@ COVERAGE_THRESHOLD=80 /test <file.py>   # override coverage threshold
 | Non-deterministic patches | `datetime.now` / `random.random` / `uuid.uuid4` / `os.environ` → auto `@patch` |
 | DB framework mocks | SQLAlchemy, Django ORM, psycopg2, pymongo, motor, redis, boto3 |
 | Dep call assertions | `self.dep.save(user)` → `mock_dep.save.assert_called_once_with(user)` |
+| **Local alias tracking** | `repo = self.repository; repo.save(x)` → `mock_repository.save.assert_called_once_with(x)` |
 | Static/classmethod isolation | Deps unused by static methods are excluded from `@patch` decorators |
 
 ### API Tests (`--api`)

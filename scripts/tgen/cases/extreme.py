@@ -142,6 +142,7 @@ def build_hypothesis_test(
     for d in patch_decorators:
         lines.append(f"    {d}")
     lines.append(f"    @settings(max_examples=50)")
+    # Always generate a sync test — async methods are wrapped with asyncio.run()
     lines.append(f"    def {test_name}({', '.join(all_args)}):")
     for mock_arg in mock_args:
         lines.append(f"        {mock_arg}.return_value = MagicMock()")
@@ -162,13 +163,20 @@ def build_hypothesis_test(
 
     call_args = ", ".join(f"{a}={a}" for a in method.args)
     expected_excs = ", ".join(method.raises) if method.raises else "Exception"
-    aw = "await " if method.is_async else ""
+
     lines.append(f"        # When — property: must never raise unexpected exceptions")
     lines.append(f"        try:")
-    if class_name:
-        lines.append(f"            {aw}sut.{method.name}({call_args})")
+    if method.is_async:
+        # Wrap async call in asyncio.run() so hypothesis works without pytest-asyncio
+        if class_name:
+            lines.append(f"            asyncio.run(sut.{method.name}({call_args}))")
+        else:
+            lines.append(f"            asyncio.run({method.name}({call_args}))")
     else:
-        lines.append(f"            {aw}{method.name}({call_args})")
+        if class_name:
+            lines.append(f"            sut.{method.name}({call_args})")
+        else:
+            lines.append(f"            {method.name}({call_args})")
     if method.raises:
         lines.append(f"        except ({expected_excs}):")
         lines.append(f"            pass  # expected exceptions are acceptable")

@@ -101,6 +101,138 @@ def _detect_nondeterministic_patches(node: ast.FunctionDef | ast.AsyncFunctionDe
     return patches
 
 
+# ── usage-based type inference ────────────────────────────────────────────────
+
+_STR_METHODS = {"strip", "upper", "lower", "split", "join", "replace", "startswith",
+                "endswith", "format", "encode", "decode", "find", "count", "index"}
+_LIST_METHODS = {"append", "extend", "pop", "remove", "insert", "sort", "reverse",
+                 "index", "count"}
+_DICT_METHODS = {"get", "keys", "values", "items", "update", "setdefault", "pop"}
+
+
+def _infer_types_from_usage(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    arg_names: list[str],
+    existing: dict[str, str],
+    defaults: dict[str, str],
+) -> dict[str, str]:
+    """
+    Infer arg types not already annotated by examining:
+      1. Default values (arg=0 → int, arg="" → str, etc.)
+      2. Comparison operators (arg > 0 → int, arg == "" → str)
+      3. Attribute / method calls (arg.strip() → str, arg.append() → list)
+      4. Arithmetic operators (+, -, *, /) → int or float (default int)
+      5. len(arg) usage → str or list (default list)
+      6. for x in arg → list
+    """
+    inferred: dict[str, str] = {}
+    unknown = set(arg_names) - set(existing)
+    if not unknown:
+        return inferred
+
+    # 1. defaults
+    _DEFAULT_TYPE: dict[str, str] = {}
+    for arg, default_repr in defaults.items():
+        if arg not in existing and arg in unknown:
+            d = default_repr.strip()
+            if d.lstrip("-").isdigit():
+                _DEFAULT_TYPE[arg] = "int"
+            elif re.match(r'^-?\d+\.\d+$', d):
+                _DEFAULT_TYPE[arg] = "float"
+            elif d.startswith(("'", '"')):
+                _DEFAULT_TYPE[arg] = "str"
+            elif d in ("True", "False"):
+                _DEFAULT_TYPE[arg] = "bool"
+            elif d in ("[]", "list()"):
+                _DEFAULT_TYPE[arg] = "list"
+            elif d in ("{}", "dict()"):
+                _DEFAULT_TYPE[arg] = "dict"
+            elif d == "None":
+                pass  # Optional — don't force a type
+    inferred.update(_DEFAULT_TYPE)
+    # refine unknown set with what we've inferred so far
+    unknown = unknown - set(inferred)
+
+    if not unknown:
+        return inferred
+
+    # 2-6. body walk
+    scores: dict[str, dict[str, int]] = {a: {} for a in unknown}
+
+    def vote(arg: str, typ: str, weight: int = 1) -> None:
+        if arg in scores:
+            scores[arg][typ] = scores[arg].get(typ, 0) + weight
+
+    for child in ast.walk(node):
+        # Comparisons: arg op constant
+        if isinstance(child, ast.Compare):
+            left = child.left
+            if isinstance(left, ast.Name) and left.id in unknown:
+                for op, comp in zip(child.ops, child.comparators):
+                    if isinstance(comp, ast.Constant):
+                        if isinstance(comp.value, (int, float)) and not isinstance(comp.value, bool):
+                            vote(left.id, "int" if isinstance(comp.value, int) else "float", 2)
+                        elif isinstance(comp.value, str):
+                            vote(left.id, "str", 2)
+            # right side
+            for comp in child.comparators:
+                if isinstance(comp, ast.Name) and comp.id in unknown:
+                    if isinstance(child.left, ast.Constant):
+                        if isinstance(child.left.value, (int, float)) and not isinstance(child.left.value, bool):
+                            vote(comp.id, "int" if isinstance(child.left.value, int) else "float", 2)
+
+        # Attribute access: arg.method(...)
+        if (isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id in unknown):
+            meth = child.attr
+            if meth in _STR_METHODS:
+                vote(child.value.id, "str", 3)
+            elif meth in _LIST_METHODS:
+                vote(child.value.id, "list", 3)
+            elif meth in _DICT_METHODS:
+                vote(child.value.id, "dict", 3)
+
+        # len(arg)
+        if (isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "len"
+                and child.args
+                and isinstance(child.args[0], ast.Name)
+                and child.args[0].id in unknown):
+            vote(child.args[0].id, "list", 1)  # could be str too, but list is safer default
+
+        # for x in arg
+        if isinstance(child, (ast.For, ast.AsyncFor)):
+            if isinstance(child.iter, ast.Name) and child.iter.id in unknown:
+                vote(child.iter.id, "list", 2)
+
+        # Arithmetic: arg + / - / * / /
+        if isinstance(child, ast.BinOp):
+            for operand in (child.left, child.right):
+                if isinstance(operand, ast.Name) and operand.id in unknown:
+                    other = child.right if operand is child.left else child.left
+                    if isinstance(child.op, ast.Add):
+                        if isinstance(other, ast.Constant) and isinstance(other.value, str):
+                            vote(operand.id, "str", 2)
+                        elif isinstance(other, ast.Constant) and isinstance(other.value, float):
+                            vote(operand.id, "float", 2)
+                        elif isinstance(other, ast.Constant) and isinstance(other.value, int) and not isinstance(other.value, bool):
+                            vote(operand.id, "int", 1)
+                    elif isinstance(child.op, (ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow)):
+                        if isinstance(other, ast.Constant) and isinstance(other.value, float):
+                            vote(operand.id, "float", 2)
+                        elif isinstance(other, ast.Constant) and isinstance(other.value, int) and not isinstance(other.value, bool):
+                            vote(operand.id, "int", 1)
+
+    for arg, type_scores in scores.items():
+        if type_scores:
+            best = max(type_scores, key=lambda t: type_scores[t])
+            inferred[arg] = best
+
+    return inferred
+
+
 # ── method / class parsing ────────────────────────────────────────────────────
 
 def _parse_method_node(
@@ -126,6 +258,12 @@ def _parse_method_node(
         for i, default in enumerate(defaults):
             if offset + i < len(arg_names):
                 arg_defaults[arg_names[offset + i]] = ast.unparse(default)
+
+    # Fill in missing type hints via usage inference
+    inferred = _infer_types_from_usage(node, arg_names, arg_types, arg_defaults)
+    for arg, typ in inferred.items():
+        if arg not in arg_types:
+            arg_types[arg] = typ
 
     ret = ast.unparse(node.returns) if node.returns else None
     is_void = ret in (None, "None")

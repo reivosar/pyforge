@@ -188,7 +188,11 @@ def _infer_dep_call_assertions(
     deps: list[DepInfo],
     ctor_map: dict[str, str],
 ) -> list[str]:
-    """Walk method body for self.dep.method() calls and emit assert_called_once[_with]() lines."""
+    """Walk method body for self.dep.method() calls and emit assert_called_once[_with]() lines.
+
+    Also handles indirect calls via local aliases:
+        repo = self.repository   →  repo.save(x) treated as self.repository.save(x)
+    """
     if not method.ast_node or not deps:
         return ["        # TODO: verify side effects manually"]
 
@@ -202,12 +206,44 @@ def _infer_dep_call_assertions(
         if fallback_attr not in attr_to_mock:
             attr_to_mock[fallback_attr] = f"mock_{dep.name.lower()}"
 
+    # Collect local aliases: local_var = self.dep_attr  →  {local_var: mock_name}
+    local_alias_to_mock: dict[str, str] = {}
+    for stmt in ast.walk(method.ast_node):
+        if (isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Attribute)
+                and isinstance(stmt.value.value, ast.Name)
+                and stmt.value.value.id == "self"):
+            local_var = stmt.targets[0].id
+            attr = stmt.value.attr
+            if attr in attr_to_mock:
+                local_alias_to_mock[local_var] = attr_to_mock[attr]
+
+    def _emit(mock_name: str, called_method: str, node: ast.Call) -> str:
+        if node.args or node.keywords:
+            is_simple = all(
+                isinstance(a, (ast.Name, ast.Constant, ast.Attribute))
+                for a in node.args
+            )
+            if is_simple:
+                arg_reprs = [ast.unparse(a) for a in node.args]
+                kw_reprs = [f"{k.arg}={ast.unparse(k.value)}" for k in node.keywords]
+                all_args_str = ", ".join(arg_reprs + kw_reprs)
+                if all_args_str:
+                    return (
+                        f"        {mock_name}.{called_method}"
+                        f".assert_called_once_with({all_args_str})"
+                    )
+        return f"        {mock_name}.{called_method}.assert_called_once()"
+
     assertions: list[str] = []
     seen: set[str] = set()
     for node in ast.walk(method.ast_node):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
+        # Pattern A: self.dep_attr.method(...)
         if (isinstance(func, ast.Attribute)
                 and isinstance(func.value, ast.Attribute)
                 and isinstance(func.value.value, ast.Name)
@@ -219,22 +255,19 @@ def _infer_dep_call_assertions(
                 key = f"{mock_name}.{called_method}"
                 if key not in seen:
                     seen.add(key)
-                    if node.args or node.keywords:
-                        is_simple = all(
-                            isinstance(a, (ast.Name, ast.Constant, ast.Attribute))
-                            for a in node.args
-                        )
-                        if is_simple:
-                            arg_reprs = [ast.unparse(a) for a in node.args]
-                            kw_reprs = [f"{k.arg}={ast.unparse(k.value)}" for k in node.keywords]
-                            all_args_str = ", ".join(arg_reprs + kw_reprs)
-                            if all_args_str:
-                                assertions.append(
-                                    f"        {mock_name}.{called_method}"
-                                    f".assert_called_once_with({all_args_str})"
-                                )
-                                continue
-                    assertions.append(f"        {mock_name}.{called_method}.assert_called_once()")
+                    assertions.append(_emit(mock_name, called_method, node))
+            continue
+        # Pattern B: local_alias.method(...)  where local_alias = self.dep_attr
+        if (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id in local_alias_to_mock):
+            mock_name = local_alias_to_mock[func.value.id]
+            called_method = func.attr
+            key = f"{mock_name}.{called_method}"
+            if key not in seen:
+                seen.add(key)
+                assertions.append(_emit(mock_name, called_method, node))
+
     return assertions or ["        # TODO: verify side effects manually"]
 
 
