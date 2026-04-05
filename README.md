@@ -1,6 +1,6 @@
 # pyforge
 
-Claude Code `/test` slash command — automatically generates pytest test files for Python source code.  
+Pytest test auto-generator for Python source code.  
 Static analysis first. Claude is only used for void/side-effect method bodies and coverage retry.
 
 > **Python only.** Full AST-based analysis: branch coverage, type inference, DI detection.
@@ -10,10 +10,7 @@ Static analysis first. Claude is only used for void/side-effect method bodies an
 ## Installation
 
 ```bash
-cp scripts/test-generator.py scripts/test-generator.sh ~/.claude/scripts/
-cp -r scripts/tgen ~/.claude/scripts/
-cp commands/test.md ~/.claude/commands/
-chmod +x ~/.claude/scripts/test-generator.sh
+pip install -e .
 ```
 
 ---
@@ -21,13 +18,16 @@ chmod +x ~/.claude/scripts/test-generator.sh
 ## Usage
 
 ```bash
-/test <file.py>                          # unit tests, standard mode
-/test <file.py> --integration            # integration tests (tests/integration/)
-/test <file.py> --api                    # API endpoint tests (FastAPI / Flask)
-/test <file.py> --mode minimal           # branches + happy path only
-/test <file.py> --mode exhaustive        # all strategies
-/test <file.py> --execute-capture        # opt-in: capture real return values
-COVERAGE_THRESHOLD=80 /test <file.py>   # override coverage threshold
+pyforge <file.py>                          # unit tests, standard mode
+pyforge <file.py> --integration            # integration tests (tests/integration/)
+pyforge <file.py> --api                    # API endpoint tests (FastAPI / Flask)
+pyforge <file.py> --mode minimal           # branches + happy path only
+pyforge <file.py> --mode exhaustive        # all strategies
+pyforge <file.py> --execute-capture        # opt-in: capture real return values
+COVERAGE_THRESHOLD=80 pyforge <file.py>   # override coverage threshold
+
+# or as a module
+python -m pyforge <file.py>
 ```
 
 ---
@@ -116,24 +116,24 @@ Names are automatically truncated to 80 characters.
 ## Project Structure
 
 ```
-scripts/
-├── test-generator.py       # thin CLI orchestrator (~200 lines)
-├── test-generator.sh       # bash wrapper
-└── tgen/
-    ├── models.py            # BranchCase, MethodInfo, ClassInfo, SourceInfo
-    ├── analysis/
-    │   └── python_ast.py    # AST analysis, detect_lang, project_root
-    ├── cases/
-    │   ├── branch.py        # analyze_method_branches, boundary cases
-    │   ├── combinatorial.py # null, enum, pairwise, defaults, union
-    │   ├── extreme.py       # extreme values, Hypothesis tests
-    │   └── __init__.py      # generate_cases() + TIER_GENERATORS
-    ├── renderers/
-    │   ├── pytest_renderer.py  # generate_python_test_file
-    │   └── api_renderer.py     # FastAPI/Flask API test generation
-    ├── runtime/
-    │   └── capture.py       # opt-in execute-and-capture
-    └── coverage.py          # run_coverage, resolve_test_path
+pyforge/
+├── cli.py               # CLI entry point (pyforge command)
+├── __main__.py          # python -m pyforge support
+├── models.py            # BranchCase, MethodInfo, ClassInfo, SourceInfo
+├── analysis/
+│   └── python_ast.py    # AST analysis, detect_lang, project_root
+├── cases/
+│   ├── branch.py        # analyze_method_branches, boundary cases
+│   ├── combinatorial.py # null, enum, pairwise, defaults, union
+│   ├── extreme.py       # extreme values, Hypothesis tests
+│   └── __init__.py      # generate_cases() + TIER_GENERATORS
+├── renderers/
+│   ├── pytest_renderer.py        # generate_python_test_file
+│   ├── api_renderer.py           # FastAPI/Flask API test generation
+│   └── db_integration_renderer.py  # real-DB integration tests + conftest
+├── runtime/
+│   └── capture.py       # opt-in execute-and-capture
+└── coverage.py          # run_coverage, resolve_test_path
 ```
 
 ---
@@ -143,12 +143,12 @@ scripts/
 Default threshold: 90%. If not met, Claude adds tests for missing branches.
 
 ```bash
-COVERAGE_THRESHOLD=80 /test path/to/file.py
+COVERAGE_THRESHOLD=80 pyforge path/to/file.py
 ```
 
 ---
 
-## Python Dependencies
+## Dependencies
 
 ```bash
 pip install pytest pytest-cov hypothesis pytest-asyncio
