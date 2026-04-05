@@ -1,4 +1,4 @@
-# test-code-generator
+# pyforge
 
 Claude Code `/test` slash command — automatically generates pytest test files for Python source code.  
 Static analysis first. Claude is only used for void/side-effect method bodies and coverage retry.
