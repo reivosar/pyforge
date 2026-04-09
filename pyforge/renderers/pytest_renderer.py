@@ -415,8 +415,19 @@ def build_python_test_method(
         else:
             lines.append(f"        {mock_arg}.return_value = MagicMock()")
 
+    # For method args with external types (like Todo), use MagicMock() instead of None
+    # This fixes cases where a method takes an external class as a parameter
+    def _arg_sample(arg_type: str | None) -> str:
+        if not arg_type:
+            return "None"
+        base = arg_type.split("[")[0].strip().strip("'\"")
+        # If it's a user-defined type (starts with uppercase, not a builtin), use MagicMock()
+        if base and base[0].isupper() and base not in _BUILTIN_TYPES and base not in _PRIMITIVE_TYPES:
+            return "MagicMock()"
+        return _type_sample(arg_type)
+
     call_args = ", ".join(
-        f"{arg}={branch.input_overrides.get(arg, method.arg_defaults.get(arg, _type_sample(method.arg_types.get(arg))))}"
+        f"{arg}={branch.input_overrides.get(arg, method.arg_defaults.get(arg, _arg_sample(method.arg_types.get(arg))))}"
         for arg in method.args
     )
 
