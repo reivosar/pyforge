@@ -42,6 +42,9 @@ STDLIB_MODULES = {
     "math", "time", "enum", "uuid", "typing", "decimal", "datetime",
     "pathlib", "logging", "hashlib", "functools", "itertools",
     "collections", "contextlib", "dataclasses", "unittest",
+    "__future__", "asyncio", "threading", "subprocess", "inspect",
+    "warnings", "traceback", "string", "struct", "socket", "signal",
+    "random", "operator", "numbers", "multiprocessing", "importlib",
 }
 
 SAMPLE_VALUES: dict[str, list[Any]] = {

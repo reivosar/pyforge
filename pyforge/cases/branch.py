@@ -127,6 +127,10 @@ def _condition_to_name(cond: ast.expr) -> str:
             isinstance(cond.left.func, ast.Name) and
             cond.left.func.id == "len"):
         arg_s = ast.unparse(cond.left.args[0]).replace("self.", "") if cond.left.args else "arg"
+        if cond.ops and isinstance(cond.ops[0], (ast.Gt, ast.GtE)):
+            return f"{_camel(arg_s)}IsTooLong"
+        if cond.ops and isinstance(cond.ops[0], (ast.Lt, ast.LtE)):
+            return f"{_camel(arg_s)}IsTooShort"
         return f"{_camel(arg_s)}IsEmpty"
 
     raw = ast.unparse(cond)
@@ -247,8 +251,22 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
             isinstance(cond.left.func, ast.Name) and
             cond.left.func.id == "len" and
             cond.left.args and isinstance(cond.left.args[0], ast.Name)):
-        if isinstance(cond.ops[0], ast.Eq):
-            inputs[cond.left.args[0].id] = "[]"
+        arg_id = cond.left.args[0].id
+        hint = arg_types.get(arg_id, "")
+        op = cond.ops[0] if cond.ops else None
+        right = cond.comparators[0] if cond.comparators else None
+        if isinstance(op, ast.Eq) and isinstance(right, ast.Constant) and right.value == 0:
+            inputs[arg_id] = "[]" if "list" in hint.lower() else '""'
+        elif isinstance(op, (ast.Gt, ast.GtE)):
+            # Generate a value longer than the threshold
+            threshold = _numeric_const(right) if right else None
+            length = int(threshold) + 1 if threshold is not None else 10001
+            if "str" in hint.lower() or not hint:
+                inputs[arg_id] = f'"a" * {length}'
+            else:
+                inputs[arg_id] = f"[0] * {length}"
+        elif isinstance(op, (ast.Lt, ast.LtE)):
+            inputs[arg_id] = "[]" if "list" in hint.lower() else '""'
 
     return inputs
 

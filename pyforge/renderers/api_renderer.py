@@ -117,7 +117,7 @@ def generate_api_test_python(
         # happy path
         lines += [
             f"",
-            f"    def return{ep['response_model'] or 'Ok'}_when{handler}CalledWithValidInput(self):",
+            f"    def test_return{ep['response_model'] or 'Ok'}_when{handler}CalledWithValidInput(self):",
             f"        # When",
         ]
         method_lower = ep["method"].lower()
@@ -131,7 +131,7 @@ def generate_api_test_python(
             nonexistent = re.sub(r"\{(\w+)\}", "999999", ep["path"])
             lines += [
                 f"",
-                f"    def return404_when{handler}CalledWithNonexistentId(self):",
+                f"    def test_return404_when{handler}CalledWithNonexistentId(self):",
                 f"        response = client.{method_lower}('{nonexistent}')",
                 f"        assert response.status_code == 404",
             ]
@@ -139,7 +139,7 @@ def generate_api_test_python(
         if ep["has_body"]:
             lines += [
                 f"",
-                f"    def return422_when{handler}CalledWithInvalidBody(self):",
+                f"    def test_return422_when{handler}CalledWithInvalidBody(self):",
                 f"        response = client.post('{sample_path}', json=None)",
                 f"        assert response.status_code == 422",
             ]
@@ -147,7 +147,7 @@ def generate_api_test_python(
         if ep["has_auth"]:
             lines += [
                 f"",
-                f"    def return401_when{handler}CalledWithoutAuthToken(self):",
+                f"    def test_return401_when{handler}CalledWithoutAuthToken(self):",
                 f"        response = client.{method_lower}('{sample_path}')",
                 f"        assert response.status_code == 401",
             ]

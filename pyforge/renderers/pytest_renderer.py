@@ -125,18 +125,20 @@ def _truncate_test_name(name: str) -> str:
     return name[:_MAX_TEST_NAME]
 
 
+_PRIMITIVE_TYPES = {"str", "int", "float", "bool", "bytes"}
+
+
 def _return_type_assertion(return_type: str) -> str:
     rt = return_type.strip().strip("'\"")
     m = re.match(r"Optional\[(.+)\]$", rt)
     if m:
         base = m.group(1).strip().split("[")[0]
-        if base in _BUILTIN_TYPES:
+        if base in _PRIMITIVE_TYPES:
             return f"        assert result is None or isinstance(result, {base})"
         return f"        assert result is None or result is not None"
     base = rt.split("[")[0].strip()
-    if base in _BUILTIN_TYPES:
-        return f"        assert isinstance(result, {base})"
-    if base and base[0].isupper():
+    # Only use isinstance for primitives; container types and ORM models will be mocks
+    if base in _PRIMITIVE_TYPES:
         return f"        assert isinstance(result, {base})"
     return f"        assert result is not None"
 
@@ -273,12 +275,75 @@ def _infer_dep_call_assertions(
 
 # ── patch / mock helpers ──────────────────────────────────────────────────────
 
-def _patch_decorators(deps: list[DepInfo], module_path: str) -> list[str]:
-    return [f"@patch('{module_path}.{dep.name}')" for dep in deps]
+def _patch_decorators(deps: list[DepInfo], module_path: str, use_async_mock: bool = False) -> list[str]:
+    nc = ", new_callable=AsyncMock" if use_async_mock else ""
+    return [f"@patch('{module_path}.{dep.name}'{nc})" for dep in deps]
 
 
 def _mock_args(deps: list[DepInfo]) -> list[str]:
     return [f"mock_{dep.name.lower()}" for dep in deps]
+
+
+def _infer_mock_result_attr_setup(
+    method: MethodInfo,
+    deps: list[DepInfo],
+    ctor_map: dict[str, str],
+) -> list[str]:
+    """Detect `result = await self.dep.method(...)` + `result.attr` patterns.
+
+    Returns setup lines like `mock_dep.dep_method.return_value.attr = None`
+    so tests don't trigger unexpected errors from truthy AsyncMock attributes.
+    """
+    if not method.ast_node:
+        return []
+
+    dep_type_to_name = {dep.name: dep.name.lower() for dep in deps}
+    attr_to_dep_type = {attr: t for attr, t in ctor_map.items() if t in dep_type_to_name}
+
+    # Find result_var → (mock_arg_name, dep_method_name)
+    result_vars: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(method.ast_node):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        val = node.value
+        if isinstance(val, ast.Await):
+            val = val.value
+        if not isinstance(val, ast.Call):
+            continue
+        func = val.func
+        if not (isinstance(func, ast.Attribute) and
+                isinstance(func.value, ast.Attribute) and
+                isinstance(func.value.value, ast.Name) and
+                func.value.value.id == "self"):
+            continue
+        dep_attr = func.value.attr
+        dep_method = func.attr
+        dep_type = attr_to_dep_type.get(dep_attr)
+        if dep_type:
+            mock_name = f"mock_{dep_type_to_name[dep_type]}"
+            result_vars[target.id] = (mock_name, dep_method)
+
+    if not result_vars:
+        return []
+
+    # Find attribute accesses on result_vars (e.g. todo.owner_id, todo.status)
+    accessed: dict[tuple[str, str], tuple[str, str]] = {}  # (mock, method) -> set of attrs
+    for node in ast.walk(method.ast_node):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if isinstance(node.value, ast.Name) and node.value.id in result_vars:
+            key = result_vars[node.value.id]
+            accessed.setdefault(key, set()).add(node.attr)  # type: ignore[arg-type]
+
+    # Generate setup lines
+    lines = []
+    for (mock_name, dep_method), attrs in accessed.items():
+        for attr in sorted(attrs):
+            lines.append(f"        {mock_name}.{dep_method}.return_value.{attr} = None")
+    return lines
 
 
 # ── test method builder ───────────────────────────────────────────────────────
@@ -292,6 +357,7 @@ def build_python_test_method(
     captured_result: str | None,
     constructor_dep_map: dict[str, str] | None = None,
     all_classes: list[ClassInfo] | None = None,
+    value_type_dep_names: set[str] | None = None,
 ) -> str:
     use_class_directly = method.is_static or method.is_classmethod
     # For static/classmethod, only patch deps that actually appear in the method body.
@@ -301,11 +367,16 @@ def build_python_test_method(
         body_src = ast.unparse(method.ast_node)
         deps = [d for d in deps if d.name in body_src]
 
+    # Exclude value-type deps (enums, constants) — they should be imported, not mocked
+    _vtypes = value_type_dep_names or set()
+    deps = [d for d in deps if d.name not in _vtypes]
+
     nd_patches = [f"@patch('{p}')" for p in method.nondeterministic_patches]
     nd_mock_args = [f"mock_{p.replace('.', '_')}" for p in method.nondeterministic_patches]
-    decorators = _patch_decorators(deps, module_path) + nd_patches
+    decorators = _patch_decorators(deps, module_path, use_async_mock=method.is_async) + nd_patches
     mock_args = _mock_args(deps) + nd_mock_args
-    all_args = ["self"] + mock_args
+    # @patch decorators are applied bottom-up, so args are received in reverse order
+    all_args = ["self"] + list(reversed(mock_args))
     db_mock_map: dict[str, list[str]] = {
         dep.name: lines for dep, lines in detect_db_mocks_python(deps)
     }
@@ -327,7 +398,7 @@ def build_python_test_method(
     for d in decorators:
         lines.append(f"    {d}")
     async_kw = "async " if method.is_async else ""
-    lines.append(f"    {async_kw}def {test_name}({', '.join(all_args)}):")
+    lines.append(f"    {async_kw}def test_{test_name}({', '.join(all_args)}):")
 
     for dep, mock_arg in zip(deps, mock_args):
         if dep.name in db_mock_map:
@@ -341,7 +412,7 @@ def build_python_test_method(
             lines.append(f"        {mock_arg}.return_value = MagicMock()")
 
     call_args = ", ".join(
-        f"{arg}={branch.input_overrides.get(arg, _type_sample(method.arg_types.get(arg)))}"
+        f"{arg}={branch.input_overrides.get(arg, method.arg_defaults.get(arg, _type_sample(method.arg_types.get(arg))))}"
         for arg in method.args
     )
 
@@ -434,6 +505,7 @@ def generate_methods_block(
     info_: SourceInfo,
     mode: str = "standard",
     execute_capture: bool = False,
+    value_type_dep_names: set[str] | None = None,
 ) -> list[str]:
     """Generate all test method lines for a list of methods."""
     active = TIER_GENERATORS.get(mode, TIER_GENERATORS["standard"])
@@ -458,6 +530,7 @@ def generate_methods_block(
         def make_body(case: BranchCase, cap: str | None = None) -> str:
             return build_python_test_method(
                 method, case, deps, module_path, class_name, cap, ctor_map, all_classes,
+                value_type_dep_names=value_type_dep_names,
             )
 
         for branch in branches:
@@ -513,7 +586,10 @@ def generate_python_test_file(
 ) -> str:
     all_methods = [m for c in info_.all_classes for m in c.methods] + info_.module_level_methods
     needs_async = any(m.is_async for m in all_methods)
-    needs_async_mock = any(dep.module.startswith("motor") for dep in info_.external_deps)
+    needs_async_mock = (
+        any(dep.module.startswith("motor") for dep in info_.external_deps)
+        or needs_async
+    )
     needs_sys = any(
         m.arg_types.get(a, "").split("[")[0].strip() == "int"
         for m in all_methods for a in m.args
@@ -533,6 +609,22 @@ def generate_python_test_file(
 
     import_names = ", ".join(c.name for c in info_.all_classes) or (info_.class_name or "*")
 
+    # Identify external deps that should be imported directly (not mocked/patched):
+    # - Enum/constant types: their names appear in method arg_defaults (e.g. "TodoStatus.PENDING")
+    # - Exception classes: names ending in Error/Exception — used in raise/except, not services
+    default_value_names: set[str] = set()
+    for m in all_methods:
+        for default_repr in m.arg_defaults.values():
+            parts = default_repr.split(".")
+            if len(parts) >= 2 and parts[0][0].isupper():
+                default_value_names.add(parts[0])
+    exception_dep_names = {
+        d.name for d in info_.external_deps
+        if d.name.endswith("Error") or d.name.endswith("Exception")
+    }
+    value_type_dep_names = default_value_names | exception_dep_names
+    value_type_deps = [d for d in info_.external_deps if d.name in value_type_dep_names]
+
     imports = [
         "import asyncio",
         "import sys",
@@ -540,6 +632,12 @@ def generate_python_test_file(
         f"from unittest.mock import {mock_imports}",
         f"from {info_.module_path} import {import_names}",
     ]
+    # Import value-type deps (enums etc.) by their original module path
+    by_module: dict[str, list[str]] = {}
+    for d in value_type_deps:
+        by_module.setdefault(d.module, []).append(d.name)
+    for mod, names in by_module.items():
+        imports.append(f"from {mod} import {', '.join(sorted(names))}")
     if needs_async:
         imports.append("# pip install pytest-asyncio  (needed for async tests)")
     if has_hypothesis:
@@ -550,6 +648,13 @@ def generate_python_test_file(
     imports += ["", ""]
 
     enum_types = detect_enum_types(target)
+    # Import locally-defined enum types referenced in arg defaults
+    local_enum_names = [e for e in enum_types if e in default_value_names and e not in import_names]
+    if local_enum_names:
+        extra = ", ".join(sorted(local_enum_names))
+        # Append to the existing module import line
+        imports[4] = imports[4] + f", {extra}"
+
     sections: list[str] = []
 
     for cls in info_.all_classes:
@@ -566,6 +671,7 @@ def generate_python_test_file(
             info_=info_,
             mode=mode,
             execute_capture=execute_capture,
+            value_type_dep_names=value_type_dep_names,
         )
         if not method_lines:
             sections.append("    pass")
@@ -587,6 +693,7 @@ def generate_python_test_file(
             info_=info_,
             mode=mode,
             execute_capture=execute_capture,
+            value_type_dep_names=value_type_dep_names,
         )
         sections.extend(method_lines)
         sections.append("")

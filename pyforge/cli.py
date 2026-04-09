@@ -203,7 +203,7 @@ def main():
 
     # coverage check + Claude retry
     if not args.integration:
-        if run_coverage(test_path, root, args.coverage):
+        if run_coverage(test_path, root, args.coverage, target=target):
             info(f"Coverage ≥ {args.coverage}% achieved.")
         else:
             info(f"Coverage below {args.coverage}% — calling Claude for missing branches...")
@@ -216,7 +216,7 @@ def main():
                 "Output ONLY the complete revised test file."
             )
             test_path.write_text(retry)
-            if run_coverage(test_path, root, args.coverage):
+            if run_coverage(test_path, root, args.coverage, target=target):
                 info(f"Coverage ≥ {args.coverage}% achieved after retry.")
             else:
                 info("WARNING: Coverage target not met. Review manually.")
