@@ -114,10 +114,14 @@ def generate_api_test_python(
         )
         status_ok = 200 if ep["method"] != "POST" else 201
 
+        # Sanitize response_model for use in method name (remove [, ], <, >, etc.)
+        response_model_name = ep['response_model'] or 'Ok'
+        response_model_safe = re.sub(r"[^A-Za-z0-9]", "", response_model_name)
+
         # happy path
         lines += [
             f"",
-            f"    def test_return{ep['response_model'] or 'Ok'}_when{handler}CalledWithValidInput(self):",
+            f"    def test_return{response_model_safe}_when{handler}CalledWithValidInput(self):",
             f"        # When",
         ]
         method_lower = ep["method"].lower()

@@ -19,13 +19,14 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "sqlalchemy": (
         "sqlalchemy_session",
         [
-            "mock_{attr} = MagicMock(spec=Session)",
-            "mock_{attr}.query.return_value.filter.return_value.first.return_value = MagicMock()",
-            "mock_{attr}.query.return_value.filter.return_value.all.return_value = []",
-            "mock_{attr}.query.return_value.get.return_value = MagicMock()",
-            "mock_{attr}.add.return_value = None",
-            "mock_{attr}.commit.return_value = None",
-            "mock_{attr}.rollback.return_value = None",
+            "mock_{attr} = AsyncMock()",
+            "mock_{attr}.get = AsyncMock(return_value=MagicMock())",
+            "mock_{attr}.execute = AsyncMock(return_value=MagicMock())",
+            "mock_{attr}.add = MagicMock(return_value=None)",
+            "mock_{attr}.commit = AsyncMock(return_value=None)",
+            "mock_{attr}.rollback = AsyncMock(return_value=None)",
+            "mock_{attr}.refresh = AsyncMock(return_value=None)",
+            "mock_{attr}.delete = AsyncMock(return_value=None)",
         ],
     ),
     "django.db": (
