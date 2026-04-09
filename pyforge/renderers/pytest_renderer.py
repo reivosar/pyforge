@@ -19,7 +19,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "sqlalchemy": (
         "sqlalchemy_session",
         [
-            "mock_{attr} = AsyncMock()",
             "mock_{attr}.get = AsyncMock(return_value=MagicMock())",
             "mock_{attr}.execute = AsyncMock(return_value=MagicMock())",
             "mock_{attr}.add = MagicMock(return_value=None)",
@@ -34,7 +33,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
         [
             "# Django ORM: use @pytest.mark.django_db on the test class",
             "# or mock the queryset:",
-            "mock_{attr} = MagicMock()",
             "mock_{attr}.filter.return_value = mock_{attr}",
             "mock_{attr}.exclude.return_value = mock_{attr}",
             "mock_{attr}.first.return_value = None",
@@ -44,7 +42,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "psycopg2": (
         "psycopg2",
         [
-            "mock_{attr} = MagicMock()",
             "mock_cursor = MagicMock()",
             "mock_{attr}.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)",
             "mock_{attr}.cursor.return_value.__exit__ = MagicMock(return_value=False)",
@@ -56,7 +53,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "pymongo": (
         "pymongo",
         [
-            "mock_{attr} = MagicMock()",
             "mock_{attr}.find_one.return_value = None",
             "mock_{attr}.find.return_value = iter([])",
             "mock_{attr}.insert_one.return_value = MagicMock(inserted_id='mock_id')",
@@ -67,7 +63,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "motor": (
         "motor_mongodb",
         [
-            "mock_{attr} = AsyncMock()",
             "mock_{attr}.find_one.return_value = None",
             "mock_{attr}.find.return_value = AsyncMock(to_list=AsyncMock(return_value=[]))",
             "mock_{attr}.insert_one.return_value = AsyncMock(inserted_id='mock_id')",
@@ -76,7 +71,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "redis": (
         "redis",
         [
-            "mock_{attr} = MagicMock()",
             "mock_{attr}.get.return_value = None",
             "mock_{attr}.set.return_value = True",
             "mock_{attr}.delete.return_value = 1",
@@ -86,7 +80,6 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
     "boto3": (
         "boto3",
         [
-            "mock_{attr} = MagicMock()",
             "mock_{attr}.Table.return_value.get_item.return_value = {'Item': {}}",
             "mock_{attr}.Table.return_value.put_item.return_value = {}",
             "mock_{attr}.Table.return_value.delete_item.return_value = {}",
@@ -178,8 +171,11 @@ def _infer_dataclass_assertions(
     rt_base = return_type.split("[")[0].strip().strip("'\"")
     matching = [c for c in all_classes if c.name == rt_base]
     if not matching:
-        return [f"        assert isinstance(result, {rt_base})"]
+        # For external deps (e.g., Todo from repository.py), use is not None
+        # since mocks don't inherit from the actual class
+        return [f"        assert result is not None  # {rt_base}"]
     cls = matching[0]
+    # For local class deps, we can check isinstance + attributes
     lines = [f"        assert isinstance(result, {rt_base})"]
     for attr in list(cls.constructor_dep_map.keys())[:3]:
         lines.append(f"        assert result.{attr} is not None")
@@ -361,10 +357,17 @@ def build_python_test_method(
     value_type_dep_names: set[str] | None = None,
 ) -> str:
     use_class_directly = method.is_static or method.is_classmethod
+    ctor_map = constructor_dep_map or {}
+
+    # For instance methods in a class, only patch constructor-injected deps
+    # (Module-level imports like select(), enums, etc. should not be patched)
+    if class_name and not use_class_directly and ctor_map:
+        ctor_dep_types = set(ctor_map.values())
+        deps = [d for d in deps if d.name in ctor_dep_types]
     # For static/classmethod, only patch deps that actually appear in the method body.
     # Instance-injected deps (from ctor_map) are irrelevant — static methods cannot
     # access self.attr, so patching them produces dead mock args.
-    if use_class_directly and method.ast_node:
+    elif use_class_directly and method.ast_node:
         body_src = ast.unparse(method.ast_node)
         deps = [d for d in deps if d.name in body_src]
 
@@ -418,7 +421,6 @@ def build_python_test_method(
     )
 
     if class_name and not use_class_directly:
-        ctor_map = constructor_dep_map or {}
         if ctor_map:
             dep_type_to_mock: dict[str, str] = {
                 dep.name: mock_arg
@@ -613,6 +615,7 @@ def generate_python_test_file(
     # Identify external deps that should be imported directly (not mocked/patched):
     # - Enum/constant types: their names appear in method arg_defaults (e.g. "TodoStatus.PENDING")
     # - Exception classes: names ending in Error/Exception — used in raise/except, not services
+    # - Return type deps: types used in method return_type annotations (e.g. "Todo" in "-> Todo")
     default_value_names: set[str] = set()
     for m in all_methods:
         for default_repr in m.arg_defaults.values():
@@ -623,7 +626,16 @@ def generate_python_test_file(
         d.name for d in info_.external_deps
         if d.name.endswith("Error") or d.name.endswith("Exception")
     }
-    value_type_dep_names = default_value_names | exception_dep_names
+
+    # Collect return type deps that need to be imported for isinstance assertions
+    return_type_dep_names: set[str] = set()
+    for m in all_methods:
+        if m.return_type and m.return_type not in (None, "None"):
+            rt_base = m.return_type.split("[")[0].strip().strip("'\"")
+            if rt_base and rt_base[0].isupper() and rt_base not in _BUILTIN_TYPES and rt_base not in _PRIMITIVE_TYPES:
+                return_type_dep_names.add(rt_base)
+
+    value_type_dep_names = (default_value_names | exception_dep_names | return_type_dep_names)
     value_type_deps = [d for d in info_.external_deps if d.name in value_type_dep_names]
 
     imports = [
@@ -633,7 +645,7 @@ def generate_python_test_file(
         f"from unittest.mock import {mock_imports}",
         f"from {info_.module_path} import {import_names}",
     ]
-    # Import value-type deps (enums etc.) by their original module path
+    # Import value-type deps (enums, exceptions, return types) by their original module path
     by_module: dict[str, list[str]] = {}
     for d in value_type_deps:
         by_module.setdefault(d.module, []).append(d.name)
