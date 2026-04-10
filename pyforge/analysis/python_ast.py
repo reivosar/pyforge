@@ -63,6 +63,12 @@ def _type_sample(type_hint: str | None) -> str:
     """Return a sensible sample value string for a given type hint."""
     if not type_hint:
         return "None"
+
+    # Handle Optional[X] by extracting X and sampling from that
+    if type_hint.startswith("Optional["):
+        inner = type_hint[9:-1].strip()  # Extract X from Optional[X]
+        return _type_sample(inner)
+
     base = type_hint.split("[")[0].strip()
     samples = SAMPLE_VALUES.get(base)
     return repr(samples[1]) if samples and len(samples) > 1 else "None"

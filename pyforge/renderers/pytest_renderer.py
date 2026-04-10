@@ -20,7 +20,9 @@ _PYTHON_DB_MOCKS: dict[str, tuple[str, list[str]]] = {
         "sqlalchemy_session",
         [
             "mock_{attr}.get = AsyncMock(return_value=MagicMock())",
-            "mock_{attr}.execute = AsyncMock(return_value=MagicMock())",
+            "mock_rows = MagicMock()",
+            "mock_rows.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))",
+            "mock_{attr}.execute = AsyncMock(return_value=mock_rows)",
             "mock_{attr}.add = MagicMock(return_value=None)",
             "mock_{attr}.commit = AsyncMock(return_value=None)",
             "mock_{attr}.rollback = AsyncMock(return_value=None)",
@@ -389,13 +391,16 @@ def _infer_mock_result_attr_setup(
         return []
 
     # Find attribute accesses on result_vars (e.g. todo.owner_id, todo.status)
+    # Exclude common method names that should not be overridden with None
+    EXCLUDE_METHODS = {"all", "scalars", "scalar", "one", "first", "count", "delete", "update"}
     accessed: dict[tuple[str, str], tuple[str, str]] = {}  # (mock, method) -> set of attrs
     for node in ast.walk(method.ast_node):
         if not isinstance(node, ast.Attribute):
             continue
         if isinstance(node.value, ast.Name) and node.value.id in result_vars:
-            key = result_vars[node.value.id]
-            accessed.setdefault(key, set()).add(node.attr)  # type: ignore[arg-type]
+            if node.attr not in EXCLUDE_METHODS:
+                key = result_vars[node.value.id]
+                accessed.setdefault(key, set()).add(node.attr)  # type: ignore[arg-type]
 
     # Generate setup lines with smart attribute values for condition branches
     lines = []
