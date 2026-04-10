@@ -138,7 +138,15 @@ def default_arg_cases(method: MethodInfo) -> list[BranchCase]:
         elif "str" in hint.lower():
             alt = '""' if default_repr.strip() != '""' else '"alt"'
         elif hint.split("[")[0].strip() in ("int", "float"):
-            alt = "0" if default_repr.strip() not in ("0", "0.0") else "-1"
+            # For int/float, use a safe non-boundary value (not 0 which often fails validation)
+            try:
+                default_val = int(default_repr.strip()) if "int" in hint else float(default_repr.strip())
+                if default_val > 1:
+                    alt = str(default_val // 2) if "int" in hint else str(default_val / 2)  # Use half the default
+                else:
+                    alt = "1" if "int" in hint else "1.0"  # Use 1 instead of 0
+            except (ValueError, ZeroDivisionError):
+                alt = "1" if "int" in hint else "1.0"
         elif "list" in hint.lower():
             alt = "[]" if default_repr.strip() != "[]" else "[1, 2, 3]"
         elif default_repr.strip() == "None":

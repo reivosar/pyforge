@@ -19,6 +19,17 @@ def detect_api_framework(source: str) -> str | None:
     return None
 
 
+def _extract_fastapi_di_functions(source: str) -> list[str]:
+    """Extract FastAPI DI factory function names (e.g., 'get_service' from Depends(get_service))."""
+    di_functions = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Depends":
+            if node.args and isinstance(node.args[0], ast.Name):
+                di_functions.append(node.args[0].id)
+    return list(set(di_functions))  # Remove duplicates
+
+
 def _extract_fastapi_endpoints(source: str) -> list[dict]:
     endpoints = []
     tree = ast.parse(source)
@@ -79,6 +90,7 @@ def generate_api_test_python(
     module_path: str,
     api_framework: str,
     endpoints: list[dict],
+    source: str = "",
 ) -> str:
     if not endpoints:
         return ""
@@ -86,20 +98,47 @@ def generate_api_test_python(
     if api_framework == "fastapi":
         client_setup = (
             f"from fastapi.testclient import TestClient\n"
-            f"from {module_path} import app\n"
-            f"client = TestClient(app)"
+            f"from {module_path} import app"
         )
+        # Extract DI functions that need to be overridden
+        di_functions = _extract_fastapi_di_functions(source) if source else []
     else:
-        client_setup = f"from {module_path} import app\nclient = app.test_client()"
+        client_setup = f"from {module_path} import app"
+        di_functions = []
 
     lines = [
         "import pytest",
-        "from unittest.mock import patch, MagicMock",
+        "from unittest.mock import patch, MagicMock, AsyncMock",
         "",
         client_setup,
-        "",
-        "",
     ]
+
+    # Add DI function imports and fixture
+    if di_functions and api_framework == "fastapi":
+        for func in sorted(di_functions):
+            lines.append(f"from {module_path} import {func}")
+        lines += [
+            "",
+            "@pytest.fixture(autouse=True)",
+            "def _override_dependencies():",
+            '    """Override FastAPI dependencies with mocks."""',
+            "    mock_service = MagicMock()",
+            "    mock_service.list_todos = AsyncMock(return_value=[])",
+            "    mock_service.get_todo = AsyncMock(return_value=MagicMock())",
+            "    mock_service.create_todo = AsyncMock(return_value=MagicMock())",
+            "    mock_service.update_status = AsyncMock(return_value=MagicMock())",
+            "    mock_service.delete_todo = AsyncMock(return_value=None)",
+        ]
+        for func in sorted(di_functions):
+            lines.append(f"    app.dependency_overrides[{func}] = lambda: mock_service")
+        lines += [
+            "    yield",
+            "    app.dependency_overrides.clear()",
+            "",
+        ]
+
+    lines.append(f"client = TestClient(app)" if api_framework == "fastapi" else "client = app.test_client()")
+    lines += ["", ""]
 
     for ep in endpoints:
         handler = _camel(ep["handler"] or ep["path"].replace("/", "_"))
@@ -112,7 +151,9 @@ def generate_api_test_python(
         lines.append(
             f"class Test{_camel(ep['handler'] or ep['path'].replace('/', '_'))}:"
         )
-        status_ok = 200 if ep["method"] != "POST" else 201
+        # Map HTTP method to expected success status code
+        status_ok_map = {"GET": 200, "POST": 201, "PUT": 200, "PATCH": 200, "DELETE": 204}
+        status_ok = status_ok_map.get(ep["method"], 200)
 
         # Sanitize response_model for use in method name (remove [, ], <, >, etc.)
         response_model_name = ep['response_model'] or 'Ok'
@@ -175,4 +216,4 @@ def generate_api_tests(
         # Django: delegate to Claude (URL patterns require project context)
         return ""
 
-    return generate_api_test_python(module_path, api_framework, endpoints)
+    return generate_api_test_python(module_path, api_framework, endpoints, source)

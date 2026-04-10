@@ -406,14 +406,40 @@ def build_python_test_method(
 
     for dep, mock_arg in zip(deps, mock_args):
         if dep.name in db_mock_map:
-            for setup_line in db_mock_map[dep.name]:
-                lines.append(f"        {setup_line}")
+            db_setup_lines = db_mock_map[dep.name]
+            # If branch needs side_effect and this is a DB mock, set side_effect on first method
+            if branch.mock_side_effect and db_setup_lines:
+                first_line = db_setup_lines[0]
+                # Extract method name: "mock_asyncsession.get = ..." → "get"
+                method_name = first_line.split(".")[1].split(" ")[0]
+                lines.append(f"        {mock_arg}.{method_name} = AsyncMock(side_effect={branch.mock_side_effect}('mocked error'))")
+                # Add remaining setup lines
+                for setup_line in db_setup_lines[1:]:
+                    lines.append(f"        {setup_line}")
+            elif branch.expected_exception == "NotFoundError" and db_setup_lines:
+                # For NotFoundError, set first method (typically get/find) to return None
+                first_line = db_setup_lines[0]
+                method_name = first_line.split(".")[1].split(" ")[0]
+                lines.append(f"        {mock_arg}.{method_name} = AsyncMock(return_value=None)")
+                for setup_line in db_setup_lines[1:]:
+                    lines.append(f"        {setup_line}")
+            else:
+                for setup_line in db_setup_lines:
+                    lines.append(f"        {setup_line}")
         elif branch.mock_side_effect:
             lines.append(f"        {mock_arg}.side_effect = {branch.mock_side_effect}('mocked error')")
         elif branch.mock_return_override is not None:
             lines.append(f"        {mock_arg}.return_value = {branch.mock_return_override}")
         else:
             lines.append(f"        {mock_arg}.return_value = MagicMock()")
+
+    # For exception branches: set default attributes on mocked return values
+    # (e.g., mock_todorepository.get_by_id.return_value.owner_id = None)
+    # Only for branches where we need to control result attributes (exception/condition branches)
+    if ctor_map and all_classes and (branch.expected_exception or branch.mock_side_effect):
+        attr_setup = _infer_mock_result_attr_setup(method, deps, ctor_map)
+        for line in attr_setup:
+            lines.append(line)
 
     # For method args with external types (like Todo), use MagicMock() instead of None
     # This fixes cases where a method takes an external class as a parameter
