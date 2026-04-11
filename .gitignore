@@ -7,5 +7,4 @@ htmlcov/
 dist/
 *.egg-info/
 .env
-test_*.py
 .claude/
