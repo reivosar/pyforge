@@ -1,5 +1,6 @@
 """pyforge CLI — auto test generator for Python files."""
 
+import argparse
 import os
 import re
 import subprocess
@@ -20,6 +21,7 @@ from pyforge.coverage import (
 )
 from pyforge.renderers.api_renderer import detect_api_framework, generate_api_tests
 from pyforge.renderers.pytest_renderer import generate_python_test_file
+from pyforge.renderers.db_integration_renderer import generate_db_integration_block
 
 
 def die(msg: str) -> None:
@@ -49,8 +51,6 @@ def call_claude(prompt: str) -> str:
 
 
 def _build_arg_parser():
-    import argparse
-
     p = argparse.ArgumentParser(
         description="Auto test generator for Python files (pytest)."
     )
@@ -192,7 +192,6 @@ def _process_file(target: Path, args):
 
     # ── DB integration test generation ────────────────────────────────────────
     if args.db_integration:
-        from pyforge.renderers.db_integration_renderer import generate_db_integration_block
         integration_block, conftest_content = generate_db_integration_block(target, root, src_info)
         if integration_block:
             test_path.write_text(test_path.read_text().rstrip() + "\n\n" + integration_block)
