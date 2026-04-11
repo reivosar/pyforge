@@ -28,83 +28,89 @@ def _override_dependencies():
 client = TestClient(app)
 
 
-class TestListTodos:
+class TestListTodosTodos:
 
-    def test_returnlistTodoResponse_whenListTodosCalledWithValidInput(self):
+    def test_returnOk_whenListTodosTodosCalledWithValidInput(self):
         # When
         response = client.get('/todos/')
 
         # Then
         assert response.status_code == 200
 
-class TestCreateTodo:
+class TestCreateTodoTodos:
 
-    def test_returnTodoResponse_whenCreateTodoCalledWithValidInput(self):
+    def test_returnTodoResponse_whenCreateTodoTodosCalledWithValidInput(self):
         # When
         response = client.post('/todos/', json={'title': 'test'})
 
         # Then
         assert response.status_code == 201
 
-    def test_return422_whenCreateTodoCalledWithInvalidBody(self):
+    def test_return422_whenCreateTodoTodosCalledWithInvalidBody(self):
         response = client.post('/todos/', json=None)
         assert response.status_code == 422
 
-class TestGetTodo:
+class TestGetTodoTodosTodoId:
 
-    def test_returnTodoResponse_whenGetTodoCalledWithValidInput(self):
+    def test_returnTodoResponse_whenGetTodoTodosTodoIdCalledWithValidInput(self):
         # When
         response = client.get('/todos/1')
 
         # Then
         assert response.status_code == 200
 
-    def test_return404_whenGetTodoCalledWithNonexistentId(self):
+    def test_return404_whenGetTodoTodosTodoIdCalledWithNonexistentId(self):
         from fastapi import HTTPException
         from examples.todo_app.app.api import get_service
         notfound = MagicMock()
         notfound.get_todo = AsyncMock(side_effect=HTTPException(status_code=404))
+        notfound.update_status = AsyncMock(side_effect=HTTPException(status_code=404))
+        notfound.delete_todo = AsyncMock(side_effect=HTTPException(status_code=404))
         app.dependency_overrides[get_service] = lambda: notfound
         response = client.get('/todos/999999')
         app.dependency_overrides.clear()
         assert response.status_code == 404
 
-class TestUpdateTodo:
+class TestUpdateTodoTodosTodoId:
 
-    def test_returnTodoResponse_whenUpdateTodoCalledWithValidInput(self):
+    def test_returnTodoResponse_whenUpdateTodoTodosTodoIdCalledWithValidInput(self):
         # When
         response = client.put('/todos/1', json={'new_status': 'pending'})
 
         # Then
         assert response.status_code == 200
 
-    def test_return404_whenUpdateTodoCalledWithNonexistentId(self):
+    def test_return404_whenUpdateTodoTodosTodoIdCalledWithNonexistentId(self):
         from fastapi import HTTPException
         from examples.todo_app.app.api import get_service
         notfound = MagicMock()
+        notfound.get_todo = AsyncMock(side_effect=HTTPException(status_code=404))
         notfound.update_status = AsyncMock(side_effect=HTTPException(status_code=404))
+        notfound.delete_todo = AsyncMock(side_effect=HTTPException(status_code=404))
         app.dependency_overrides[get_service] = lambda: notfound
         response = client.put('/todos/999999', json={'new_status': 'pending'})
         app.dependency_overrides.clear()
         assert response.status_code == 404
 
-    def test_return422_whenUpdateTodoCalledWithInvalidBody(self):
+    def test_return422_whenUpdateTodoTodosTodoIdCalledWithInvalidBody(self):
         response = client.put('/todos/1', json=None)
         assert response.status_code == 422
 
-class TestDeleteTodo:
+class TestDeleteTodoTodosTodoId:
 
-    def test_returnOk_whenDeleteTodoCalledWithValidInput(self):
+    def test_returnOk_whenDeleteTodoTodosTodoIdCalledWithValidInput(self):
         # When
         response = client.delete('/todos/1')
 
         # Then
         assert response.status_code == 204
 
-    def test_return404_whenDeleteTodoCalledWithNonexistentId(self):
+    def test_return404_whenDeleteTodoTodosTodoIdCalledWithNonexistentId(self):
         from fastapi import HTTPException
         from examples.todo_app.app.api import get_service
         notfound = MagicMock()
+        notfound.get_todo = AsyncMock(side_effect=HTTPException(status_code=404))
+        notfound.update_status = AsyncMock(side_effect=HTTPException(status_code=404))
         notfound.delete_todo = AsyncMock(side_effect=HTTPException(status_code=404))
         app.dependency_overrides[get_service] = lambda: notfound
         response = client.delete('/todos/999999')

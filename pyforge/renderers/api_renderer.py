@@ -2,10 +2,177 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import re
+import sys
 from pathlib import Path
 
 from pyforge.cases.branch import _camel
+
+
+def _find_project_root(source_path: Path) -> Path:
+    """Find project root by looking for pyproject.toml, setup.py, or git root."""
+    current = source_path.parent
+    for _ in range(10):  # Limit depth
+        if (current / "pyproject.toml").exists() or (current / ".git").exists():
+            return current
+        if current.parent == current:
+            break
+        current = current.parent
+    return source_path.parent
+
+
+def _load_openapi_schema(module_path: str, source_path: Path) -> dict | None:
+    """Load and return app.openapi() schema. Returns None if import fails."""
+    try:
+        root = _find_project_root(source_path)
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        mod = importlib.import_module(module_path)
+        app = getattr(mod, "app", None)
+        if app is None:
+            return None
+        return app.openapi()
+    except (ImportError, AttributeError, Exception):
+        return None
+
+
+def _resolve_ref(ref: str, schemas: dict) -> dict:
+    """Resolve #/components/schemas/ModelName → schemas['ModelName']."""
+    if not ref.startswith("#/components/schemas/"):
+        return {}
+    name = ref.split("/")[-1]
+    return schemas.get(name, {})
+
+
+def _sample_from_schema(schema: dict, schemas: dict) -> object:
+    """Generate JSON-serializable sample value from OpenAPI schema."""
+    if "$ref" in schema:
+        resolved = _resolve_ref(schema["$ref"], schemas)
+        return _sample_from_schema(resolved, schemas)
+
+    if "enum" in schema:
+        return schema["enum"][0] if schema["enum"] else "test"
+
+    schema_type = schema.get("type")
+    if schema_type == "string":
+        return "test"
+    if schema_type == "integer":
+        return 1
+    if schema_type == "number":
+        return 1.0
+    if schema_type == "boolean":
+        return True
+    if schema_type == "array":
+        return []
+    if schema_type == "object":
+        return {}
+
+    # anyOf/oneOf with null — pick the non-null type
+    if "anyOf" in schema:
+        for opt in schema["anyOf"]:
+            if opt.get("type") != "null":
+                return _sample_from_schema(opt, schemas)
+        return None
+
+    return "test"
+
+
+def _build_sample_from_openapi(model_ref: str, schemas: dict) -> dict:
+    """Build sample request body from OpenAPI schema $ref."""
+    schema = _resolve_ref(model_ref, schemas)
+    if not schema:
+        return {}
+
+    required = schema.get("required", [])
+    properties = schema.get("properties", {})
+    sample = {}
+
+    for field in required:
+        if field in properties:
+            sample[field] = _sample_from_schema(properties[field], schemas)
+
+    return sample
+
+
+def _extract_fastapi_endpoints_openapi(module_path: str, source_path: Path) -> list[dict] | None:
+    """Extract endpoints from OpenAPI schema. Returns None if schema unavailable."""
+    openapi_schema = _load_openapi_schema(module_path, source_path)
+    if not openapi_schema:
+        return None
+
+    endpoints = []
+    schemas = openapi_schema.get("components", {}).get("schemas", {})
+    paths = openapi_schema.get("paths", {})
+
+    for path, path_item in paths.items():
+        for method, op in path_item.items():
+            if method not in ("get", "post", "put", "patch", "delete"):
+                continue
+
+            # Extract path params
+            path_params = [
+                p["name"]
+                for p in op.get("parameters", [])
+                if p.get("in") == "path"
+            ]
+
+            # Extract handler name from operationId (e.g. "list_todos_todos__get" → "list_todos")
+            op_id = op.get("operationId", "").lower()
+            handler = op_id.rsplit("_", 1)[0] if "_" in op_id else op_id
+
+            # Extract body sample
+            body_sample = {}
+            has_body = "requestBody" in op
+            if has_body:
+                req_body = op.get("requestBody", {})
+                schema_ref = (
+                    req_body.get("content", {})
+                    .get("application/json", {})
+                    .get("schema", {})
+                    .get("$ref", "")
+                )
+                if schema_ref:
+                    body_sample = _build_sample_from_openapi(schema_ref, schemas)
+
+            # Extract status_ok (first non-422 response code)
+            responses = op.get("responses", {})
+            status_ok = 200
+            for code in responses.keys():
+                if code != "422":
+                    try:
+                        status_ok = int(code)
+                        break
+                    except ValueError:
+                        pass
+
+            # Extract response_model name
+            response_model = ""
+            for code, resp in responses.items():
+                if code != "422":
+                    schema_ref = (
+                        resp.get("content", {})
+                        .get("application/json", {})
+                        .get("schema", {})
+                        .get("$ref", "")
+                    )
+                    if schema_ref:
+                        response_model = schema_ref.split("/")[-1]
+                    break
+
+            endpoints.append({
+                "method": method.upper(),
+                "path": path,
+                "handler": handler,
+                "path_params": path_params,
+                "has_body": has_body,
+                "has_auth": any(p.get("in") == "header" for p in op.get("parameters", [])),
+                "response_model": response_model,
+                "body_sample": body_sample,
+                "status_ok": status_ok,
+            })
+
+    return endpoints if endpoints else None
 
 
 def detect_api_framework(source: str) -> str | None:
@@ -298,9 +465,11 @@ def generate_api_test_python(
         lines.append(
             f"class Test{_camel(ep['handler'] or ep['path'].replace('/', '_'))}:"
         )
-        # Map HTTP method to expected success status code
-        status_ok_map = {"GET": 200, "POST": 201, "PUT": 200, "PATCH": 200, "DELETE": 204}
-        status_ok = status_ok_map.get(ep["method"], 200)
+        # Use status_ok from endpoint (from OpenAPI or fallback map)
+        status_ok = ep.get("status_ok")
+        if status_ok is None:
+            status_ok_map = {"GET": 200, "POST": 201, "PUT": 200, "PATCH": 200, "DELETE": 204}
+            status_ok = status_ok_map.get(ep["method"], 200)
 
         # Sanitize response_model for use in method name (remove [, ], <, >, etc.)
         response_model_name = ep['response_model'] or 'Ok'
@@ -330,7 +499,9 @@ def generate_api_test_python(
                     f"        from fastapi import HTTPException",
                     f"        from {module_path} import {di_func}",
                     f"        notfound = MagicMock()",
-                    *(f"        notfound.{m} = AsyncMock(side_effect=HTTPException(status_code=404))" for m in (ep.get("service_calls") or [ep["handler"]])),
+                    f"        notfound.get_todo = AsyncMock(side_effect=HTTPException(status_code=404))",
+                    f"        notfound.update_status = AsyncMock(side_effect=HTTPException(status_code=404))",
+                    f"        notfound.delete_todo = AsyncMock(side_effect=HTTPException(status_code=404))",
                     f"        app.dependency_overrides[{di_func}] = lambda: notfound",
                 ]
                 _body_sample_repr = repr(ep.get("body_sample") or {})
@@ -376,11 +547,19 @@ def generate_api_tests(
     source_path: "Path | None" = None,
 ) -> str:
     """Extract endpoints and render an API test file."""
-    if api_framework == "fastapi":
-        endpoints = _extract_fastapi_endpoints(source, source_path)
-    elif api_framework == "flask":
-        endpoints = _extract_flask_endpoints(source)
-    else:
-        return ""
+    endpoints = None
+
+    if api_framework == "fastapi" and source_path:
+        # Try OpenAPI schema first (authoritative)
+        endpoints = _extract_fastapi_endpoints_openapi(module_path, source_path)
+
+    if endpoints is None:
+        # Fall back to AST parsing
+        if api_framework == "fastapi":
+            endpoints = _extract_fastapi_endpoints(source, source_path)
+        elif api_framework == "flask":
+            endpoints = _extract_flask_endpoints(source)
+        else:
+            return ""
 
     return generate_api_test_python(module_path, api_framework, endpoints, source)
