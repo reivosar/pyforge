@@ -205,25 +205,12 @@ def _process_file(target: Path, args):
         else:
             info("--db-integration passed but no DB dependencies detected — skipping.")
 
-    # coverage check + Claude retry
+    # coverage check
     if not args.integration:
         if run_coverage(test_path, root, args.coverage, target=target):
             info(f"Coverage ≥ {args.coverage}% achieved.")
         else:
-            info(f"Coverage below {args.coverage}% — calling Claude for missing branches...")
-            retry = call_claude(
-                f"Tests did not achieve {args.coverage}% coverage. "
-                "Add tests for missing branches.\n"
-                "Keep all existing tests. Same naming/When-Then rules.\n\n"
-                f"## Test file\n{test_path.read_text()}\n\n"
-                f"## Source\n{source_text}\n\n"
-                "Output ONLY the complete revised test file."
-            )
-            test_path.write_text(retry)
-            if run_coverage(test_path, root, args.coverage, target=target):
-                info(f"Coverage ≥ {args.coverage}% achieved after retry.")
-            else:
-                info("WARNING: Coverage target not met. Review manually.")
+            info(f"WARNING: Coverage below {args.coverage}%. Review and add tests manually.")
 
     info(f"Done: {test_path}")
 
