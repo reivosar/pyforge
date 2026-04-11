@@ -30,7 +30,139 @@ def _extract_fastapi_di_functions(source: str) -> list[str]:
     return list(set(di_functions))  # Remove duplicates
 
 
-def _extract_fastapi_endpoints(source: str) -> list[dict]:
+def _extract_service_method_calls(handler_node: ast.FunctionDef) -> list[str]:
+    """Return service method names called inside the handler (e.g. service.update_status → ['update_status'])."""
+    calls = []
+    for node in ast.walk(handler_node):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "service"):
+            calls.append(node.func.attr)
+    return calls
+
+
+def _extract_body_model_name(handler_node: ast.FunctionDef) -> str | None:
+    """Return the Pydantic body parameter type name from a FastAPI handler."""
+    defaults = handler_node.args.defaults
+    args = handler_node.args.args
+    offset = len(args) - len(defaults)
+    for i, arg in enumerate(args):
+        if arg.annotation is None:
+            continue
+        type_name = ast.unparse(arg.annotation)
+        if type_name in ("str", "int", "float", "bool", "None", "HTTPException"):
+            continue
+        # Skip Depends params
+        default_idx = i - offset
+        if default_idx >= 0:
+            d = defaults[default_idx]
+            if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "Depends":
+                continue
+        # Skip Optional/query params (no annotation or simple type)
+        if type_name.startswith("Optional[") or type_name.startswith("list["):
+            continue
+        return type_name
+    return None
+
+
+def _ann_to_sample(ann: ast.expr, enum_first: dict[str, str]) -> object | None:
+    """Convert an AST annotation node to a sample JSON-serializable value.
+
+    Returns None to signal "skip this field" (Optional with default).
+    """
+    if isinstance(ann, ast.Name):
+        name = ann.id
+        if name == "str":
+            return "test"
+        if name == "int":
+            return 1
+        if name == "float":
+            return 1.0
+        if name == "bool":
+            return True
+        # Enum or custom class — return first member value if known
+        return enum_first.get(name, "test")
+    if isinstance(ann, ast.Attribute):
+        # e.g. models.TodoStatus
+        return enum_first.get(ann.attr, "test")
+    if isinstance(ann, ast.Subscript):
+        # Optional[X] → skip (has_default implied), list[X] → []
+        if isinstance(ann.value, ast.Name):
+            if ann.value.id == "Optional":
+                return None  # caller will skip
+            if ann.value.id in ("List", "list"):
+                return []
+        return None
+    return "test"
+
+
+def _collect_enum_first_values(tree: ast.Module) -> dict[str, str]:
+    """Return {ClassName: first_member_value} for Enum-like classes."""
+    result: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for item in node.body:
+            if isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if isinstance(target, ast.Name) and item.value:
+                        raw = ast.unparse(item.value).strip("'\"")
+                        if node.name not in result:
+                            result[node.name] = raw
+                        break
+    return result
+
+
+def _collect_all_enum_values(source: str, source_path: "Path | None" = None) -> dict[str, str]:
+    """Collect Enum first values from source and any imported local modules."""
+    from pathlib import Path as _Path
+    tree = ast.parse(source)
+    result = _collect_enum_first_values(tree)
+    if not source_path:
+        return result
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        mod_file = node.module.replace(".", "/") + ".py"
+        for root in [source_path.parent, source_path.parent.parent,
+                     source_path.parent.parent.parent, _Path.cwd()]:
+            candidate = root / mod_file
+            if candidate.exists():
+                try:
+                    imported_tree = ast.parse(candidate.read_text())
+                    result.update(_collect_enum_first_values(imported_tree))
+                except Exception:
+                    pass
+                break
+    return result
+
+
+def _build_sample_body(source: str, model_name: str, source_path: "Path | None" = None) -> dict:
+    """Parse a Pydantic BaseModel class and return a sample JSON-serializable dict."""
+    tree = ast.parse(source)
+    enum_first = _collect_all_enum_values(source, source_path)
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == model_name):
+            continue
+        sample: dict = {}
+        for item in node.body:
+            if not (isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)):
+                continue
+            field = item.target.id
+            # Fields with any default value → not required, skip
+            if item.value is not None:
+                continue
+            val = _ann_to_sample(item.annotation, enum_first)
+            if val is None:
+                continue
+            sample[field] = val
+        return sample
+    return {}
+
+
+def _extract_fastapi_endpoints(source: str, source_path: "Path | None" = None) -> list[dict]:
     endpoints = []
     tree = ast.parse(source)
     for node in ast.walk(tree):
@@ -57,11 +189,19 @@ def _extract_fastapi_endpoints(source: str) -> list[dict]:
                 for kw in deco.keywords:
                     if kw.arg == "response_model":
                         response_model = ast.unparse(kw.value)
+            body_sample: dict = {}
+            if http_method in ("POST", "PUT", "PATCH"):
+                model_name = _extract_body_model_name(node)
+                if model_name:
+                    body_sample = _build_sample_body(source, model_name, source_path)
+            service_calls = _extract_service_method_calls(node)
             endpoints.append({
                 "method": http_method, "path": path, "handler": node.name,
                 "path_params": path_params,
                 "has_body": http_method in ("POST", "PUT", "PATCH"),
                 "has_auth": has_auth, "response_model": response_model,
+                "body_sample": body_sample,
+                "service_calls": service_calls,
             })
     return endpoints
 
@@ -174,25 +314,45 @@ def generate_api_test_python(
         ]
         method_lower = ep["method"].lower()
         if ep["has_body"]:
-            lines.append(f"        response = client.{method_lower}('{sample_path}', json={{}})")
+            body = ep.get("body_sample") or {}
+            lines.append(f"        response = client.{method_lower}('{sample_path}', json={body!r})")
         else:
             lines.append(f"        response = client.{method_lower}('{sample_path}')")
         lines += [f"", f"        # Then", f"        assert response.status_code == {status_ok}"]
 
         if ep["path_params"]:
             nonexistent = re.sub(r"\{(\w+)\}", "999999", ep["path"])
-            lines += [
-                f"",
-                f"    def test_return404_when{handler}CalledWithNonexistentId(self):",
-                f"        response = client.{method_lower}('{nonexistent}')",
-                f"        assert response.status_code == 404",
-            ]
+            if di_functions:
+                di_func = sorted(di_functions)[0]
+                lines += [
+                    f"",
+                    f"    def test_return404_when{handler}CalledWithNonexistentId(self):",
+                    f"        from fastapi import HTTPException",
+                    f"        from {module_path} import {di_func}",
+                    f"        notfound = MagicMock()",
+                    *(f"        notfound.{m} = AsyncMock(side_effect=HTTPException(status_code=404))" for m in (ep.get("service_calls") or [ep["handler"]])),
+                    f"        app.dependency_overrides[{di_func}] = lambda: notfound",
+                ]
+                _body_sample_repr = repr(ep.get("body_sample") or {})
+                body_arg = f", json={_body_sample_repr}" if ep["has_body"] else ""
+                lines += [
+                    f"        response = client.{method_lower}('{nonexistent}'{body_arg})",
+                    f"        app.dependency_overrides.clear()",
+                    f"        assert response.status_code == 404",
+                ]
+            else:
+                lines += [
+                    f"",
+                    f"    def test_return404_when{handler}CalledWithNonexistentId(self):",
+                    f"        response = client.{method_lower}('{nonexistent}')",
+                    f"        assert response.status_code == 404",
+                ]
 
         if ep["has_body"]:
             lines += [
                 f"",
                 f"    def test_return422_when{handler}CalledWithInvalidBody(self):",
-                f"        response = client.post('{sample_path}', json=None)",
+                f"        response = client.{method_lower}('{sample_path}', json=None)",
                 f"        assert response.status_code == 422",
             ]
 
@@ -213,14 +373,14 @@ def generate_api_tests(
     source: str,
     api_framework: str,
     module_path: str,
+    source_path: "Path | None" = None,
 ) -> str:
     """Extract endpoints and render an API test file."""
     if api_framework == "fastapi":
-        endpoints = _extract_fastapi_endpoints(source)
+        endpoints = _extract_fastapi_endpoints(source, source_path)
     elif api_framework == "flask":
         endpoints = _extract_flask_endpoints(source)
     else:
-        # Django: delegate to Claude (URL patterns require project context)
         return ""
 
     return generate_api_test_python(module_path, api_framework, endpoints, source)

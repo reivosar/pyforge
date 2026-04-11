@@ -136,7 +136,7 @@ def _process_file(target: Path, args):
         if not api_framework:
             die("No API routes detected in this file.")
         info(f"API framework: {api_framework}")
-        content = generate_api_tests(source_text, api_framework, module_path)
+        content = generate_api_tests(source_text, api_framework, module_path, source_path=target)
         if not content:
             info("No endpoints detected statically — delegating to Claude.")
             content = call_claude(
