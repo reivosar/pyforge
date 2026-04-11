@@ -69,7 +69,7 @@ def run_coverage(test_file: Path, root: Path, threshold: int, target: Path | Non
             output = r.stdout + r.stderr
             cov_failure = (
                 f"Required test coverage of {threshold}%" in output
-                or f"total of " in output and f"is less than fail-under={threshold}" in output
+                or (f"total of " in output and f"is less than fail-under={threshold}" in output)
             )
             if not cov_failure:
                 return True  # Tests may fail, but coverage threshold check is not the issue

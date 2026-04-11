@@ -378,7 +378,7 @@ def _boundary_cases_from_condition(
             right.value >= 0):
         arg, N = left.args[0].id, right.value
         hint = arg_types.get(arg, "")
-        is_str = "str" in hint.lower()
+        is_str = is_base(parse_type(hint), "str")
 
         def make_len_val(n: int) -> str:
             n = max(0, n)
