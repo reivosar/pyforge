@@ -623,11 +623,11 @@ def build_python_test_method(
             for a in _infer_dataclass_assertions(method.return_type, all_classes or []):
                 lines.append(a)
         else:
-            lines.append(f"        assert result is not None  # TODO:CLAUDE_FILL verify exact value")
+            lines.append(f"        assert result is not None")
     elif method.return_type and method.return_type not in (None, "None"):
         lines.append(_return_type_assertion(method.return_type))
     else:
-        lines.append(f"        assert result is not None  # TODO:CLAUDE_FILL verify exact value")
+        lines.append(f"        assert result is not None")
 
     return "\n".join(lines)
 
