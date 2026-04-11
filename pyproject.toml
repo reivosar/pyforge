@@ -14,3 +14,19 @@ pyforge = "pyforge.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pyforge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["pyforge"]
+omit = [
+    "pyforge/renderers/*",
+    "pyforge/__main__.py",
+    "pyforge/cli.py",
+    "pyforge/runtime/*",
+]
+
+[tool.coverage.report]
+fail_under = 90

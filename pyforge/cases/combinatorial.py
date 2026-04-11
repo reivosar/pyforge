@@ -3,21 +3,59 @@ from __future__ import annotations
 
 import re
 
-from pyforge.analysis.python_ast import SAMPLE_VALUES, _type_sample
+from pyforge.analysis.python_ast import (
+    SAMPLE_VALUES,
+    _type_sample,
+    is_base,
+    is_nullable,
+    parse_type,
+    type_sample,
+    unwrap_optional,
+    UnionType,
+)
 from pyforge.cases.branch import _camel
 from pyforge.models import BranchCase, MethodInfo
 
 
+def _parse_union_members(type_hint: str) -> list[str]:
+    """
+    Parse union type hint strings and return list of member type names.
+    Handles Union[...], Optional[...], and X|Y syntax.
+    Returns empty list for non-union types.
+    """
+    if not type_hint or not isinstance(type_hint, str):
+        return []
+
+    # Handle Optional[X] -> "str, None"
+    if type_hint.startswith("Optional["):
+        inner = type_hint[9:-1]  # Remove "Optional[" and "]"
+        return [inner.strip(), "None"]
+
+    # Handle Union[X, Y, Z]
+    if type_hint.startswith("Union["):
+        inner = type_hint[6:-1]  # Remove "Union[" and "]"
+        members = [m.strip() for m in inner.split(",")]
+        return members
+
+    # Handle X | Y | Z syntax
+    if " | " in type_hint:
+        members = [m.strip() for m in type_hint.split(" | ")]
+        return members
+
+    # Not a union type
+    return []
+
+
 def null_combination_cases(method: MethodInfo) -> list[BranchCase]:
     """
-    For each nullable arg (Optional[X] or untyped), generate one BranchCase
+    For each nullable arg (Optional[X], X | None, or untyped), generate one BranchCase
     with that arg=None. Only activates when the method has ≥2 args.
     """
     if len(method.args) < 2:
         return []
     nullable = [
         a for a in method.args
-        if not method.arg_types.get(a) or "Optional" in method.arg_types.get(a, "")
+        if is_nullable(parse_type(method.arg_types.get(a)))
     ]
     return [
         BranchCase(
@@ -132,25 +170,39 @@ def default_arg_cases(method: MethodInfo) -> list[BranchCase]:
             expected_exception=None, expected_return=None,
             is_happy_path=False,
         ))
-        hint = method.arg_types.get(arg, "")
-        if "bool" in hint.lower():
+        t = parse_type(method.arg_types.get(arg, ""))
+        inner = unwrap_optional(t)
+
+        # Handle Union types by picking the first concrete member
+        if isinstance(inner, UnionType):
+            concrete = [m for m in inner.members if not is_base(m, "none")]
+            inner = concrete[0] if concrete else inner
+
+        if is_base(inner, "bool"):
             alt = "False" if default_repr.strip() == "True" else "True"
-        elif "str" in hint.lower():
+        elif is_base(inner, "str"):
             alt = '""' if default_repr.strip() != '""' else '"alt"'
-        elif hint.split("[")[0].strip() in ("int", "float"):
+        elif is_base(inner, "int") or is_base(inner, "float"):
             # For int/float, use a safe non-boundary value (not 0 which often fails validation)
             try:
-                default_val = int(default_repr.strip()) if "int" in hint else float(default_repr.strip())
+                is_int = is_base(inner, "int")
+                default_val = int(default_repr.strip()) if is_int else float(default_repr.strip())
                 if default_val > 1:
-                    alt = str(default_val // 2) if "int" in hint else str(default_val / 2)  # Use half the default
+                    alt = str(default_val // 2) if is_int else str(default_val / 2)
                 else:
-                    alt = "1" if "int" in hint else "1.0"  # Use 1 instead of 0
+                    alt = "1" if is_int else "1.0"
             except (ValueError, ZeroDivisionError):
-                alt = "1" if "int" in hint else "1.0"
-        elif "list" in hint.lower():
+                alt = "1" if is_base(inner, "int") else "1.0"
+        elif is_base(inner, "list"):
             alt = "[]" if default_repr.strip() != "[]" else "[1, 2, 3]"
         elif default_repr.strip() == "None":
-            alt = _type_sample(hint) if hint else '"value"'
+            # For Optional[ExternalType] = None, use MagicMock() as non-default
+            sample = type_sample(inner)
+            if sample == "None":
+                # External type (like TodoStatus) - use MagicMock()
+                alt = "MagicMock()"
+            else:
+                alt = sample
         else:
             alt = None
         if alt and alt != default_repr:
@@ -164,22 +216,6 @@ def default_arg_cases(method: MethodInfo) -> list[BranchCase]:
     return cases
 
 
-def _parse_union_members(hint: str) -> list[str]:
-    """Extract member types from Union[X, Y] or X | Y."""
-    hint = hint.strip()
-    m = re.match(r"Union\[(.+)\]$", hint)
-    if m:
-        return [t.strip() for t in m.group(1).split(",")]
-    if "|" in hint and not hint.startswith("Optional"):
-        parts = [p.strip() for p in hint.split("|")]
-        if len(parts) >= 2:
-            return parts
-    m2 = re.match(r"Optional\[(.+)\]$", hint)
-    if m2:
-        return [m2.group(1).strip(), "None"]
-    return []
-
-
 def union_type_cases(method: MethodInfo) -> list[BranchCase]:
     """
     For each arg with a Union / Optional / X|Y type hint,
@@ -188,16 +224,29 @@ def union_type_cases(method: MethodInfo) -> list[BranchCase]:
     cases: list[BranchCase] = []
     for arg in method.args:
         hint = method.arg_types.get(arg, "")
-        members = _parse_union_members(hint)
-        concrete = [m for m in members if m not in ("None", "NoneType")]
+        t = parse_type(hint)
+        if not isinstance(t, UnionType):
+            continue
+        # Get non-None members
+        concrete = [m for m in t.members if not is_base(m, "none")]
         if len(concrete) < 2:
             continue
         for member in concrete:
-            sample = _type_sample(member)
+            sample = type_sample(member)
             if sample == "None":
                 continue
+            # Format member name for test: BaseType("str") → "Str"
+            from pyforge.analysis.python_ast import BaseType, GenericType, UnknownType
+            if isinstance(member, BaseType):
+                member_name = member.name.capitalize()
+            elif isinstance(member, GenericType):
+                member_name = member.name
+            elif isinstance(member, UnknownType):
+                member_name = _camel(member.raw)
+            else:
+                member_name = "Value"
             cases.append(BranchCase(
-                test_name=f"complete_when{_camel(arg)}Is{_camel(member)}",
+                test_name=f"complete_when{_camel(arg)}Is{member_name}",
                 input_overrides={arg: sample},
                 mock_side_effect=None, mock_return_override=None,
                 expected_exception=None, expected_return=None,

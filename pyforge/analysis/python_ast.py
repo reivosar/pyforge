@@ -4,10 +4,173 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from pyforge.models import BranchCase, ClassInfo, DepInfo, MethodInfo, OrmModelInfo, SourceInfo
+
+
+# ── Type expression model (structured type hint representation) ────────────────
+
+class TypeExpr:
+    """Structured representation of a Python type hint."""
+
+
+@dataclass
+class BaseType(TypeExpr):
+    """Primitive or canonical type: 'int', 'str', 'list', 'dict', 'bool', 'float', 'none'."""
+    name: str
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, BaseType) and self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+
+@dataclass
+class GenericType(TypeExpr):
+    """Generic type like List[int], Dict[str, int], etc."""
+    name: str
+    args: list[TypeExpr] = field(default_factory=list)
+
+
+@dataclass
+class UnionType(TypeExpr):
+    """Union or Optional type."""
+    members: list[TypeExpr]
+
+
+@dataclass
+class UnknownType(TypeExpr):
+    """External or user-defined type that wasn't recognized."""
+    raw: str
+
+
+NONE = BaseType("none")
+
+
+def parse_type(hint: str | None) -> TypeExpr:
+    """Parse a type hint string into a TypeExpr. Never raises."""
+    if not hint:
+        return NONE
+    hint = hint.strip()
+    # X | Y | Z  — split only at bracket depth 0
+    if "|" in hint:
+        parts = _split_depth0(hint, "|")
+        members = [parse_type(p) for p in parts]
+        # Flatten: if only two members and one is None → Optional
+        non_none = [m for m in members if m != NONE]
+        if len(non_none) == 1 and len(members) == 2:
+            return UnionType([non_none[0], NONE])
+        return UnionType(members)
+    # Optional[X]
+    if hint.startswith("Optional[") and hint.endswith("]"):
+        inner = parse_type(hint[9:-1])
+        return UnionType([inner, NONE])
+    # Union[X, Y, ...]
+    if hint.startswith("Union[") and hint.endswith("]"):
+        parts = _split_depth0(hint[6:-1], ",")
+        return UnionType([parse_type(p) for p in parts])
+    # Generic[args]
+    if "[" in hint and hint.endswith("]"):
+        bracket = hint.index("[")
+        name = hint[:bracket].strip()
+        inner = _split_depth0(hint[bracket + 1 : -1], ",")
+        return GenericType(name, [parse_type(a) for a in inner])
+    # Base type
+    canonical = hint.strip().lower()
+    if canonical in (
+        "int",
+        "str",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "bytes",
+        "none",
+        "nonetype",
+    ):
+        return BaseType(canonical)
+    return UnknownType(hint)
+
+
+def _split_depth0(s: str, sep: str) -> list[str]:
+    """Split string on sep only when bracket depth == 0."""
+    parts, depth, buf = [], 0, ""
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in "([{":
+            depth += 1
+            buf += ch
+        elif ch in ")]}":
+            depth -= 1
+            buf += ch
+        elif depth == 0 and s[i : i + len(sep)] == sep:
+            if buf.strip():
+                parts.append(buf.strip())
+            buf = ""
+            i += len(sep)
+            continue
+        else:
+            buf += ch
+        i += 1
+    if buf.strip():
+        parts.append(buf.strip())
+    return parts
+
+
+def is_base(t: TypeExpr, name: str) -> bool:
+    """Check if t is a BaseType with the given name."""
+    return isinstance(t, BaseType) and t.name == name
+
+
+def is_nullable(t: TypeExpr) -> bool:
+    """Check if a type can be None."""
+    if isinstance(t, UnionType):
+        return any(m == NONE or is_base(m, "none") for m in t.members)
+    return isinstance(t, BaseType) and t.name == "none"
+
+
+def unwrap_optional(t: TypeExpr) -> TypeExpr:
+    """For Union[X, None], return X. Otherwise return t."""
+    if isinstance(t, UnionType):
+        non_none = [m for m in t.members if not is_base(m, "none")]
+        if len(non_none) == 1:
+            return non_none[0]
+    return t
+
+
+def type_sample(t: TypeExpr) -> str:
+    """Return a representative sample value string for a TypeExpr."""
+    if isinstance(t, UnionType):
+        for m in t.members:
+            if not is_base(m, "none"):
+                s = type_sample(m)
+                if s != "None":
+                    return s
+        return "None"
+    if isinstance(t, BaseType):
+        return {
+            "int": "1",
+            "str": "'test'",
+            "float": "1.0",
+            "bool": "True",
+            "list": "[]",
+            "dict": "{}",
+            "set": "set()",
+            "bytes": "b''",
+            "none": "None",
+        }.get(t.name, "None")
+    if isinstance(t, GenericType):
+        return type_sample(BaseType(t.name.lower()))
+    if isinstance(t, UnknownType):
+        return "MagicMock()"
+    return "None"
 
 
 # ── project detection ─────────────────────────────────────────────────────────
@@ -242,6 +405,21 @@ def _infer_types_from_usage(
     return inferred
 
 
+# ── constants for parsing ────────────────────────────────────────────────────
+
+PROTOCOL_DUNDERS = {
+    "__call__",
+    "__enter__",
+    "__exit__",
+    "__iter__",
+    "__next__",
+    "__len__",
+    "__contains__",
+    "__getitem__",
+    "__setitem__",
+}
+
+
 # ── method / class parsing ────────────────────────────────────────────────────
 
 def _parse_method_node(
@@ -294,7 +472,7 @@ def _parse_method_node(
         arg_types=arg_types,
         return_type=ret,
         is_void=is_void,
-        is_public=not node.name.startswith("_"),
+        is_public=not node.name.startswith("_") or node.name in PROTOCOL_DUNDERS,
         is_async=isinstance(node, ast.AsyncFunctionDef),
         is_static=is_static,
         is_classmethod=is_cls,
@@ -329,6 +507,16 @@ def _parse_constructor_deps(init_node: ast.FunctionDef | ast.AsyncFunctionDef) -
     return dep_map
 
 
+# ── Enum and AST helper functions ─────────────────────────────────────────────
+
+ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+
+
+def _is_enum_base(base_str: str) -> bool:
+    """Check if a base class string refers to an Enum type."""
+    return base_str.split(".")[-1] in ENUM_BASES
+
+
 # ── main analysis entry points ────────────────────────────────────────────────
 
 def analyze_python(target: Path, root: Path) -> SourceInfo:
@@ -352,6 +540,15 @@ def analyze_python(target: Path, root: Path) -> SourceInfo:
                         name=alias.name,
                         alias=alias.asname,
                     ))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in STDLIB_MODULES:
+                    external_deps.append(DepInfo(
+                        module=alias.name,
+                        name=alias.name,
+                        alias=alias.asname,
+                    ))
 
     all_classes: list[ClassInfo] = []
     module_level_methods: list[MethodInfo] = []
@@ -363,15 +560,16 @@ def analyze_python(target: Path, root: Path) -> SourceInfo:
             ctor_dep_map: dict[str, str] = {}
             for item in node.body:
                 if isinstance(item, _func_types):
-                    if item.name.startswith("__") and item.name != "__init__":
-                        continue
+                    if item.name.startswith("__") and item.name.endswith("__"):
+                        if item.name not in {"__init__"} | PROTOCOL_DUNDERS:
+                            continue
                     m = _parse_method_node(item, is_class_method=True)
                     if m.name == "__init__":
                         ctor_dep_map = _parse_constructor_deps(item)
                     elif m.is_public:
                         class_methods.append(m)
             bases = [ast.unparse(b) for b in node.bases]
-            if not any("Enum" in b for b in bases):
+            if not any(_is_enum_base(b) for b in bases):
                 all_classes.append(ClassInfo(
                     name=node.name,
                     methods=class_methods,
@@ -465,7 +663,7 @@ def detect_enum_types(target: Path) -> dict[str, list[str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             bases = [ast.unparse(b) for b in node.bases]
-            if any("Enum" in b for b in bases):
+            if any(_is_enum_base(b) for b in bases):
                 members = [
                     t.id
                     for item in node.body

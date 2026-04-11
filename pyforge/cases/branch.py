@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import re
 
+from pyforge.analysis.python_ast import is_base, parse_type
 from pyforge.models import BranchCase, MethodInfo
 
 
@@ -64,6 +65,23 @@ def _condition_to_name(cond: ast.expr) -> str:
         type_s = ast.unparse(cond.args[1]).split(".")[-1]
         return f"{_camel(arg_s)}Is{_camel(type_s)}"
 
+    # len(x) OP N — check before other comparisons since len() calls are ast.Compare
+    if (isinstance(cond, ast.Compare) and len(cond.ops) == 1
+            and isinstance(cond.left, ast.Call)
+            and isinstance(cond.left.func, ast.Name)
+            and cond.left.func.id == "len"):
+        arg_s = ast.unparse(cond.left.args[0]).replace("self.", "") if cond.left.args else "arg"
+        op = cond.ops[0]
+        if isinstance(op, (ast.Gt, ast.GtE)):
+            return f"{_camel(arg_s)}IsTooLong"
+        if isinstance(op, (ast.Lt, ast.LtE)):
+            return f"{_camel(arg_s)}IsTooShort"
+        if isinstance(op, ast.Eq):
+            n = _numeric_const(cond.comparators[0]) if cond.comparators else None
+            if n is not None:
+                return f"{_camel(arg_s)}LenIs{int(n)}"
+        return f"{_camel(arg_s)}IsEmpty"
+
     # x in collection  /  x not in collection
     if isinstance(cond, ast.Compare) and len(cond.ops) == 1:
         left, op, right = cond.left, cond.ops[0], cond.comparators[0]
@@ -121,17 +139,6 @@ def _condition_to_name(cond: ast.expr) -> str:
             return f"{_camel(subject_s)}OutOfRange{lo_s}To{hi_s}"
         inner = ast.unparse(inner_cond).replace("self.", "")
         return f"{_camel(re.sub(r'[^a-zA-Z0-9]', '_', inner))}IsFalse"
-
-    if (isinstance(cond, ast.Compare) and
-            isinstance(cond.left, ast.Call) and
-            isinstance(cond.left.func, ast.Name) and
-            cond.left.func.id == "len"):
-        arg_s = ast.unparse(cond.left.args[0]).replace("self.", "") if cond.left.args else "arg"
-        if cond.ops and isinstance(cond.ops[0], (ast.Gt, ast.GtE)):
-            return f"{_camel(arg_s)}IsTooLong"
-        if cond.ops and isinstance(cond.ops[0], (ast.Lt, ast.LtE)):
-            return f"{_camel(arg_s)}IsTooShort"
-        return f"{_camel(arg_s)}IsEmpty"
 
     raw = ast.unparse(cond)
     return _camel(re.sub(r"[^a-zA-Z0-9]", "_", raw))
@@ -193,9 +200,10 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
             # x not in [a, b, c]  →  use a sentinel value not in the collection
             if isinstance(op, ast.NotIn) and arg:
                 hint = arg_types.get(arg, "")
-                if "str" in hint.lower():
+                t = parse_type(hint)
+                if is_base(t, "str"):
                     inputs[arg] = '"__not_in_value__"'
-                elif "int" in hint.lower():
+                elif is_base(t, "int"):
                     inputs[arg] = "-99999"
                 else:
                     inputs[arg] = "None"
@@ -232,10 +240,14 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
         elif isinstance(inner_cond, ast.Name):
             arg = inner_cond.id
             hint = arg_types.get(arg, "")
-            if "list" in hint.lower(): inputs[arg] = "[]"
-            elif "dict" in hint.lower(): inputs[arg] = "{}"
-            elif "str" in hint.lower(): inputs[arg] = '""'
-            else: inputs[arg] = "[]"
+            t = parse_type(hint)
+            if is_base(t, "list"):
+                inputs[arg] = "[]"
+            elif is_base(t, "dict"):
+                inputs[arg] = "{}"
+            elif is_base(t, "str"):
+                inputs[arg] = '""'
+            # For unknown types, don't provide a default (leave unset)
 
     # opaque call: if validate(x): → supply a type-sample for each Name arg
     if isinstance(cond, ast.Call):
@@ -253,20 +265,21 @@ def _condition_to_inputs(cond: ast.expr, arg_types: dict[str, str]) -> dict[str,
             cond.left.args and isinstance(cond.left.args[0], ast.Name)):
         arg_id = cond.left.args[0].id
         hint = arg_types.get(arg_id, "")
+        t = parse_type(hint)
         op = cond.ops[0] if cond.ops else None
         right = cond.comparators[0] if cond.comparators else None
         if isinstance(op, ast.Eq) and isinstance(right, ast.Constant) and right.value == 0:
-            inputs[arg_id] = "[]" if "list" in hint.lower() else '""'
+            inputs[arg_id] = "[]" if is_base(t, "list") else '""'
         elif isinstance(op, (ast.Gt, ast.GtE)):
             # Generate a value longer than the threshold
             threshold = _numeric_const(right) if right else None
             length = int(threshold) + 1 if threshold is not None else 10001
-            if "str" in hint.lower() or not hint:
+            if is_base(t, "str") or not hint:
                 inputs[arg_id] = f'"a" * {length}'
             else:
                 inputs[arg_id] = f"[0] * {length}"
         elif isinstance(op, (ast.Lt, ast.LtE)):
-            inputs[arg_id] = "[]" if "list" in hint.lower() else '""'
+            inputs[arg_id] = "[]" if is_base(t, "list") else '""'
 
     return inputs
 
@@ -303,14 +316,20 @@ def _boundary_cases_from_condition(
                 ]
                 for val, triggers in boundary_pairs:
                     label = f"AtBoundary{repr(val)}".replace("-", "Minus").replace(".", "Dot").replace("'", "")
-                    if triggers:
-                        pass  # happy region, no extra case needed
-                    elif exc_name:
+                    if triggers and exc_name:
                         cases.append(BranchCase(
                             test_name=_truncate_test_name(f"raise{exc_name}_when{_camel(arg)}Is{label}"),
                             input_overrides={arg: repr(val)},
                             mock_side_effect=None, mock_return_override=None,
                             expected_exception=exc_name, expected_return=None,
+                            is_happy_path=False,
+                        ))
+                    elif not triggers:
+                        cases.append(BranchCase(
+                            test_name=_truncate_test_name(f"notRaise_when{_camel(arg)}Is{label}"),
+                            input_overrides={arg: repr(val)},
+                            mock_side_effect=None, mock_return_override=None,
+                            expected_exception=None, expected_return=None,
                             is_happy_path=False,
                         ))
         return cases
@@ -356,7 +375,7 @@ def _boundary_cases_from_condition(
             left.func.id == "len" and
             left.args and isinstance(left.args[0], ast.Name) and
             isinstance(right, ast.Constant) and isinstance(right.value, int) and
-            right.value > 0):
+            right.value >= 0):
         arg, N = left.args[0].id, right.value
         hint = arg_types.get(arg, "")
         is_str = "str" in hint.lower()
@@ -422,7 +441,16 @@ def analyze_method_branches(method: MethodInfo) -> list[BranchCase]:
       - always appends the happy path    → normal return case
     """
     if method.ast_node is None:
-        return [BranchCase("", {}, None, None, None, None, True)]
+        # No AST available, return just the happy path with a meaningful name
+        return [BranchCase(
+            test_name="happyPath",
+            input_overrides={},
+            mock_side_effect=None,
+            mock_return_override=None,
+            expected_exception=None,
+            expected_return=None,
+            is_happy_path=True,
+        )]
 
     node: ast.FunctionDef = method.ast_node
     cases: list[BranchCase] = []
