@@ -6,11 +6,41 @@ import pytest
 
 from pyforge.coverage import (
     find_uncovered_methods,
+    parse_missing_coverage,
+    project_root_from_path,
     resolve_api_test_path,
     resolve_test_path,
     run_coverage,
 )
 from pyforge.models import MethodInfo, SourceInfo
+
+
+class TestProjectRootFromPath:
+    """Tests for project_root_from_path."""
+
+    def test_returnGitRoot_whenInsideGitRepo(self, tmp_path):
+        """Given a file inside a git repo, when project_root_from_path is called, then it returns the git root."""
+        target = tmp_path / "module.py"
+        target.touch()
+        with patch("pyforge.coverage.subprocess.run") as mock_run:
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = str(tmp_path) + "\n"
+            mock_run.return_value = mock_result
+            result = project_root_from_path(target)
+        assert result == tmp_path
+
+    def test_returnParentDir_whenNotInsideGitRepo(self, tmp_path):
+        """Given a file not inside a git repo, when project_root_from_path is called, then it returns the parent directory."""
+        target = tmp_path / "module.py"
+        target.touch()
+        with patch("pyforge.coverage.subprocess.run") as mock_run:
+            mock_result = MagicMock()
+            mock_result.returncode = 1
+            mock_result.stdout = ""
+            mock_run.return_value = mock_result
+            result = project_root_from_path(target)
+        assert result == tmp_path
 
 
 class TestResolveTestPath:
@@ -266,6 +296,39 @@ class TestRunCoverage:
         )
 
     @patch("pyforge.coverage.subprocess.run")
+    def test_useTargetModulePath_whenTargetInsideRoot(self, mock_run, tmp_path):
+        """Given a target file inside root, when run_coverage is called, then it uses the dotted module path."""
+        test_file = tmp_path / "test_service.py"
+        test_file.write_text("pass")
+        target = tmp_path / "app" / "service.py"
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+        run_coverage(test_file, tmp_path, 90, target=target)
+        call_args = mock_run.call_args[0][0]
+        assert "--cov=app.service" in call_args
+
+    @patch("pyforge.coverage.subprocess.run")
+    def test_useTargetStem_whenTargetNotRelativeToRoot(self, mock_run, tmp_path):
+        """Given a target file outside root, when run_coverage is called, then it falls back to stem as module name."""
+        test_file = tmp_path / "test_service.py"
+        test_file.write_text("pass")
+        # target is in a completely different path (not relative to tmp_path)
+        import tempfile
+        with tempfile.TemporaryDirectory() as other_dir:
+            target = Path(other_dir) / "mymodule.py"
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_result.stderr = ""
+            mock_run.return_value = mock_result
+            run_coverage(test_file, tmp_path, 90, target=target)
+            call_args = mock_run.call_args[0][0]
+            assert "--cov=mymodule" in call_args
+
+    @patch("pyforge.coverage.subprocess.run")
     def test_passThresholdValue_whenRunCoverageCalled(self, mock_run, tmp_path):
         """Given a coverage threshold value, when run_coverage is called, then it passes the threshold to the subprocess."""
         test_file = tmp_path / "test_service.py"
@@ -283,3 +346,64 @@ class TestRunCoverage:
         assert mock_run.called
         call_args = mock_run.call_args[0][0]
         assert "--cov-fail-under=85" in call_args
+
+
+class TestParseMissingCoverage:
+    """Tests for parse_missing_coverage."""
+
+    def test_returnEmpty_whenNoCoverageData(self):
+        """Given empty stdout, when parse_missing_coverage is called, then it returns an empty list."""
+        result = parse_missing_coverage("")
+        assert result == []
+
+    def test_returnEmpty_whenAllCoverageHigh(self):
+        """Given all files with high coverage, when parse_missing_coverage is called, then it returns empty list."""
+        stdout = (
+            "Name              Stmts   Miss  Cover   Missing\n"
+            "----------------------------------------------\n"
+            "service.py            20      1    95%   42\n"
+            "----------------------------------------------\n"
+            "TOTAL                 20      1    95%\n"
+        )
+        result = parse_missing_coverage(stdout)
+        assert result == []
+
+    def test_returnLowCoverageFiles_whenSomeFilesLowCoverage(self):
+        """Given files with low coverage, when parse_missing_coverage is called, then it returns those files."""
+        stdout = (
+            "Name              Stmts   Miss  Cover   Missing\n"
+            "----------------------------------------------\n"
+            "service.py            50     25    50%   1-10, 20-30\n"
+            "utils.py              20      3    85%   42\n"
+            "----------------------------------------------\n"
+            "TOTAL                 70     28    60%\n"
+        )
+        result = parse_missing_coverage(stdout)
+        assert len(result) == 1
+        assert any("service.py" in r for r in result)
+        assert any("50%" in r for r in result)
+        assert not any("utils.py" in r for r in result)  # 85% is above 80% threshold
+
+    def test_excludeTOTAL_whenParsingCoverageOutput(self):
+        """Given a TOTAL line, when parse_missing_coverage is called, then TOTAL is not included in results."""
+        stdout = (
+            "Name              Stmts   Miss  Cover\n"
+            "--------------------------------------\n"
+            "service.py            50     40    20%\n"
+            "TOTAL                 50     40    20%\n"
+        )
+        result = parse_missing_coverage(stdout)
+        assert any("service.py" in r for r in result)
+        assert not any("TOTAL" in r for r in result)
+
+    def test_returnZeroCoverageFile_whenFileHasZeroCoverage(self):
+        """Given a file with 0% coverage, when parse_missing_coverage is called, then it is included."""
+        stdout = (
+            "Name          Stmts   Miss  Cover   Missing\n"
+            "------------------------------------------\n"
+            "new_module.py     30     30     0%   1-30\n"
+        )
+        result = parse_missing_coverage(stdout)
+        assert len(result) == 1
+        assert "new_module.py" in result[0]
+        assert "0%" in result[0]
