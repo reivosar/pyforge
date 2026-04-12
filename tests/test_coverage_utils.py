@@ -7,6 +7,7 @@ import pytest
 from pyforge.coverage import (
     find_uncovered_methods,
     parse_missing_coverage,
+    parse_missing_lines,
     project_root_from_path,
     resolve_api_test_path,
     resolve_test_path,
@@ -346,6 +347,64 @@ class TestRunCoverage:
         assert mock_run.called
         call_args = mock_run.call_args[0][0]
         assert "--cov-fail-under=85" in call_args
+
+
+class TestParseMissingLines:
+    """Tests for parse_missing_lines."""
+
+    _SAMPLE = (
+        "Name                    Stmts   Miss  Cover   Missing\n"
+        "------------------------------------------------------\n"
+        "pyforge/models.py          53      0   100%\n"
+        "pyforge/coverage.py        84     23    73%   54-58, 62, 66-70\n"
+        "TOTAL                     137     23    83%\n"
+    )
+
+    def test_returnEmpty_whenStdoutEmpty(self):
+        assert parse_missing_lines("", "pyforge/coverage.py") == set()
+
+    def test_returnEmpty_whenFileNotInOutput(self):
+        assert parse_missing_lines(self._SAMPLE, "pyforge/missing.py") == set()
+
+    def test_returnEmpty_whenFileHasFullCoverage(self):
+        assert parse_missing_lines(self._SAMPLE, "pyforge/models.py") == set()
+
+    def test_parseSingleLine(self):
+        stdout = "pyforge/foo.py   10   1   90%   42\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == {42}
+
+    def test_parseRange(self):
+        stdout = "pyforge/foo.py   10   5   50%   10-14\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == {10, 11, 12, 13, 14}
+
+    def test_parseMixedTokens(self):
+        result = parse_missing_lines(self._SAMPLE, "pyforge/coverage.py")
+        assert result == {54, 55, 56, 57, 58, 62, 66, 67, 68, 69, 70}
+
+    def test_normalizeBackslash(self):
+        # pytest-cov always outputs forward slashes; rel_path may arrive with
+        # backslashes (Windows caller) — normalization converts rel_path to /
+        stdout = "pyforge/foo.py   10   1   90%   5\n"
+        assert parse_missing_lines(stdout, "pyforge\\foo.py") == {5}
+
+    def test_returnEmpty_whenPercentAtLineEnd(self):
+        # No tokens after the % → nothing to parse, should not crash
+        stdout = "pyforge/foo.py   10   0   100%\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == set()
+
+    def test_returnEmpty_whenMatchingLineHasTooFewParts(self):
+        # Line contains the needle but has < 4 whitespace-separated parts
+        stdout = "pyforge/foo.py   short\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == set()
+
+    def test_ignoreInvalidTokens(self):
+        # Tokens that can't be parsed as ints should be silently skipped
+        stdout = "pyforge/foo.py   10   2   80%   bad, 5\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == {5}
+
+    def test_ignoreInvalidRange(self):
+        stdout = "pyforge/foo.py   10   2   80%   a-b, 7\n"
+        assert parse_missing_lines(stdout, "pyforge/foo.py") == {7}
 
 
 class TestParseMissingCoverage:
