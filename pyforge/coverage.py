@@ -42,6 +42,41 @@ def find_uncovered_methods(info_: SourceInfo, test_file: Path) -> list[MethodInf
     return [m for m in info_.methods if m.name not in test_content]
 
 
+def parse_missing_lines(stdout: str, rel_path: str) -> set[int]:
+    """Parse coverage term-missing output and return missing line numbers for one file.
+
+    Args:
+        stdout:   Raw pytest --cov-report=term-missing stdout.
+        rel_path: Relative file path as it appears in coverage output, e.g.
+                  "pyforge/models.py".  Separators must match the OS format
+                  used by pytest-cov (forward slash on POSIX).
+    """
+    missing: set[int] = set()
+    needle = rel_path.replace("\\", "/")
+    for line in stdout.splitlines():
+        if needle not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        for i, part in enumerate(parts):
+            if "%" in part and i + 1 < len(parts):
+                for token in " ".join(parts[i + 1:]).replace(",", " ").split():
+                    if "-" in token:
+                        try:
+                            a, b = token.split("-", 1)
+                            missing.update(range(int(a), int(b) + 1))
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            missing.add(int(token))
+                        except ValueError:
+                            pass
+                break
+    return missing
+
+
 def parse_missing_coverage(coverage_stdout: str) -> list[str]:
     """Parse coverage report and return list of files with 0% or low coverage."""
     lines = coverage_stdout.split("\n")

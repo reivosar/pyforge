@@ -8,8 +8,12 @@ version = "0.1.0"
 description = "Auto test generator for Python files (pytest)"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+
 [project.scripts]
 pyforge = "pyforge.cli:main"
+pyforge-mcp = "pyforge.mcp_server:run"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -26,6 +30,7 @@ omit = [
     "pyforge/renderers/*",
     "pyforge/__main__.py",
     "pyforge/cli.py",
+    "pyforge/mcp_server.py",
     "pyforge/runtime/*",
 ]
 
