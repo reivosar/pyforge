@@ -42,8 +42,30 @@ def find_uncovered_methods(info_: SourceInfo, test_file: Path) -> list[MethodInf
     return [m for m in info_.methods if m.name not in test_content]
 
 
-def run_coverage(test_file: Path, root: Path, threshold: int, target: Path | None = None) -> bool:
-    """Run pytest with coverage and return True if threshold is met."""
+def parse_missing_coverage(coverage_stdout: str) -> list[str]:
+    """Parse coverage report and return list of files with 0% or low coverage."""
+    lines = coverage_stdout.split("\n")
+    missing = []
+    for line in lines:
+        # Look for lines with coverage percentages
+        # Format: "filename.py        50      25    50%    1-10, 20-30"
+        if "%" in line and ("py" in line or "TOTAL" in line):
+            parts = line.split()
+            if len(parts) >= 4:
+                # Try to find the coverage percentage
+                for part in parts:
+                    if "%" in part:
+                        coverage_pct = int(part.rstrip("%"))
+                        if coverage_pct < 80:  # Flag files with < 80% coverage
+                            filename = parts[0]
+                            if filename != "TOTAL" and not filename.startswith("-"):
+                                missing.append(f"{filename} ({coverage_pct}%)")
+                        break
+    return missing
+
+
+def run_coverage(test_file: Path, root: Path, threshold: int, target: Path | None = None) -> tuple[bool, str]:
+    """Run pytest with coverage and return (success, stdout)."""
     print(f"[test-gen] Running coverage (threshold: {threshold}%)...")
     try:
         if target is not None:
@@ -72,8 +94,8 @@ def run_coverage(test_file: Path, root: Path, threshold: int, target: Path | Non
                 or (f"total of " in output and f"is less than fail-under={threshold}" in output)
             )
             if not cov_failure:
-                return True  # Tests may fail, but coverage threshold check is not the issue
-        return r.returncode == 0
+                return True, r.stdout  # Tests may fail, but coverage threshold check is not the issue
+        return r.returncode == 0, r.stdout
     except FileNotFoundError as e:
         print(f"[test-gen] Coverage tool not found ({e}), skipping.")
-        return False
+        return False, ""

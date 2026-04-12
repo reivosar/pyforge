@@ -188,7 +188,7 @@ class TestRunCoverage:
         test_file.write_text("pass")
         mock_run.side_effect = FileNotFoundError()
 
-        result = run_coverage(test_file, tmp_path, 90)
+        result, _ = run_coverage(test_file, tmp_path, 90)
         assert result is False
 
     @patch("pyforge.coverage.subprocess.run")
@@ -204,7 +204,7 @@ class TestRunCoverage:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        result = run_coverage(test_file, tmp_path, 90)
+        result, _ = run_coverage(test_file, tmp_path, 90)
         assert result is True
 
     @patch("pyforge.coverage.subprocess.run")
@@ -222,7 +222,7 @@ class TestRunCoverage:
         mock_result.stderr = "AssertionError: expected 1 but got 2"
         mock_run.return_value = mock_result
 
-        result = run_coverage(test_file, tmp_path, 90)
+        result, _ = run_coverage(test_file, tmp_path, 90)
         assert result is True
 
     @patch("pyforge.coverage.subprocess.run")
@@ -240,7 +240,7 @@ class TestRunCoverage:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        result = run_coverage(test_file, tmp_path, 90)
+        result, _ = run_coverage(test_file, tmp_path, 90)
         assert result is False
 
     @patch("pyforge.coverage.subprocess.run")
