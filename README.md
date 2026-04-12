@@ -1,9 +1,9 @@
 # pyforge
 
 Pytest test auto-generator for Python source code.
-Static analysis first. Claude is only used for void/side-effect method bodies and coverage retry.
+100% static analysis — no external AI dependencies. Full AST-based branch coverage, type inference, and DI detection.
 
-> **Python only.** Full AST-based analysis: branch coverage, type inference, DI detection.
+> **Python only.** Zero-dependency test generation: OpenAPI schemas, AST branch analysis, type inference, DI detection.
 
 ---
 
@@ -81,7 +81,7 @@ python -m pyforge <file.py>
 5. `assert result == <literal>` — for `return {"ok": True}` / `return 0` patterns
 6. Dataclass field assertions — when return type matches a local class
 7. `isinstance(result, X)` — for known return types
-8. `assert result is not None  # TODO:CLAUDE_FILL` — fallback
+8. `assert result is not None` — fallback when type cannot be inferred
 
 ### Dependency Injection
 
@@ -96,9 +96,16 @@ python -m pyforge <file.py>
 
 ### API Tests (`--api`)
 
-| Framework | Generated patterns |
-| --- | --- |
-| FastAPI / Flask | 200/201, 404, 422, 401 per endpoint |
+| Framework | Detection Method | Generated patterns |
+| --- | --- | --- |
+| FastAPI | OpenAPI schema (`app.openapi()`) + AST fallback | 200, 4xx, 5xx per endpoint (methods, paths, request/response schemas) |
+| Flask | AST decorator parsing (`@app.route`) | 200, 404 per route |
+
+**How it works:**
+1. Try to dynamically load FastAPI OpenAPI schema via `importlib.import_module()`
+2. Parse `paths`, extract request bodies, response schemas, and status codes
+3. If that fails, fall back to AST parsing of route decorators
+4. If both fail: generate a failing stub test with clear error message
 
 ---
 
@@ -146,7 +153,7 @@ pyforge/
 
 ## Coverage
 
-Default threshold: 90%. If not met, Claude adds tests for missing branches.
+Default threshold: 90%. If coverage falls below threshold, you'll see a warning — manually review and add tests if needed (pyforge will not auto-generate coverage-retry tests).
 
 ```bash
 COVERAGE_THRESHOLD=80 pyforge path/to/file.py
